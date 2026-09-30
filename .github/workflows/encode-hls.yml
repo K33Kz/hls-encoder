@@ -1,0 +1,88 @@
+# Put this file at .github/workflows/encode-hls.yml in your repo.
+# Run it from the Actions tab -> "Encode movie to HLS" -> Run workflow.
+#
+# Required repo secrets (Settings -> Secrets and variables -> Actions):
+#   R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET
+
+name: Encode movie to HLS
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_key:
+        description: "Path of the MP4 inside your R2 bucket (e.g. movies/mymovie.mp4)"
+        required: true
+      slug:
+        description: "Output folder name, letters/numbers/-/_ only (e.g. mymovie)"
+        required: true
+      height:
+        description: "Output height: 720, 1080, or source"
+        default: "720"
+      segment_seconds:
+        description: "Segment length in seconds (smaller = tighter sync, more playlist requests)"
+        default: "4"
+
+jobs:
+  encode:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      # Needed for R2 with recent AWS CLI versions
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+      R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+      BUCKET: ${{ secrets.R2_BUCKET }}
+      # Inputs passed via env (not inlined into scripts) to avoid shell injection
+      SOURCE_KEY: ${{ inputs.source_key }}
+      SLUG: ${{ inputs.slug }}
+      HEIGHT: ${{ inputs.height }}
+      SEG: ${{ inputs.segment_seconds }}
+
+    steps:
+      - name: Validate inputs
+        run: |
+          [[ "$SLUG" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "Bad slug"; exit 1; }
+          [[ "$SEG" =~ ^[0-9]+$ ]] || { echo "Bad segment_seconds"; exit 1; }
+          [[ "$HEIGHT" =~ ^([0-9]+|source)$ ]] || { echo "Bad height"; exit 1; }
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Download source from R2
+        run: aws s3 cp "s3://$BUCKET/$SOURCE_KEY" source.mp4 --endpoint-url "$R2_ENDPOINT"
+
+      - name: Encode to HLS
+        run: |
+          mkdir -p out
+          if [ "$HEIGHT" = "source" ]; then VF=(); else VF=(-vf "scale=-2:$HEIGHT"); fi
+          # Keyframes are forced exactly every $SEG seconds so every segment
+          # has the same length. The Worker relies on that for its timing math.
+          ffmpeg -hide_banner -y -i source.mp4 "${VF[@]}" \
+            -c:v libx264 -preset veryfast -crf 21 -profile:v high -pix_fmt yuv420p \
+            -force_key_frames "expr:gte(t,n_forced*$SEG)" -sc_threshold 0 \
+            -c:a aac -b:a 128k -ac 2 -ar 48000 \
+            -f hls -hls_time "$SEG" -hls_playlist_type vod \
+            -hls_flags independent_segments \
+            -hls_segment_filename "out/seg_%05d.ts" \
+            out/index.m3u8
+
+      - name: Write meta.json
+        run: |
+          COUNT=$(ls out/seg_*.ts | wc -l)
+          LAST=$(grep '^#EXTINF' out/index.m3u8 | tail -1 | sed 's/#EXTINF:\([0-9.]*\).*/\1/')
+          echo "{\"segmentSeconds\": $SEG, \"count\": $COUNT, \"lastSeconds\": $LAST}" > out/meta.json
+          cat out/meta.json
+
+      - name: Upload to R2
+        run: |
+          DEST="s3://$BUCKET/hls/$SLUG/"
+          aws s3 cp out/ "$DEST" --recursive --exclude "*" --include "*.ts" \
+            --content-type video/mp2t --endpoint-url "$R2_ENDPOINT"
+          aws s3 cp out/index.m3u8 "$DEST" \
+            --content-type application/vnd.apple.mpegurl --endpoint-url "$R2_ENDPOINT"
+          aws s3 cp out/meta.json "$DEST" \
+            --content-type application/json --endpoint-url "$R2_ENDPOINT"
+          echo "Uploaded to hls/$SLUG/"
