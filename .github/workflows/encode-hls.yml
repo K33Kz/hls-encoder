@@ -61,7 +61,7 @@ jobs:
           # Keyframes are forced exactly every $SEG seconds so every segment
           # has the same length. The Worker relies on that for its timing math.
           ffmpeg -hide_banner -y -i source.mp4 "${VF[@]}" \
-            -c:v libx264 -preset veryfast -crf 21 -profile:v high -pix_fmt yuv420p \
+            -c:v libx264 -preset superfast -crf 21 -profile:v high -pix_fmt yuv420p \
             -force_key_frames "expr:gte(t,n_forced*$SEG)" -sc_threshold 0 \
             -c:a aac -b:a 128k -ac 2 -ar 48000 \
             -f hls -hls_time "$SEG" -hls_playlist_type vod \
