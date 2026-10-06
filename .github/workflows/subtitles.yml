@@ -1,0 +1,384 @@
+# .github/workflows/subtitles.yml
+#
+# Adds subtitles to a movie that's already been encoded (same slug).
+#   method = file      a subtitle file you uploaded to R2 (.srt/.vtt/.ass), e.g. from a subtitle site
+#   method = embedded  subtitles already inside the movie file (usually .mkv)
+#   method = generate  made from the movie's audio with Whisper (about 30-60 min for a full movie)
+# translate_to adds machine-translated copies (e.g. es,fr,pt).
+# Output: hls/<slug>/subs/<lang>.vtt and hls/<slug>/subs/index.json
+#
+# Required repo secrets: R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET
+
+name: Add subtitles
+
+on:
+  workflow_dispatch:
+    inputs:
+      slug:
+        description: "The movie's slug (same as when you encoded it)"
+        required: true
+      method:
+        description: "file = subtitle file, embedded = inside the movie, generate = from the audio"
+        type: choice
+        options: [file, embedded, generate]
+        default: file
+      source_key:
+        description: "File name in R2: the subtitle file (file) or the movie (embedded/generate)"
+        required: true
+      language:
+        description: "Language code of the subtitles, e.g. en. Use auto with generate to detect it"
+        default: "en"
+      translate_to:
+        description: "Optional: more languages to machine-translate into, e.g. es,fr,pt"
+        default: ""
+      offset_seconds:
+        description: "Shift timing: negative = earlier, positive = later (e.g. -1.5)"
+        default: "0"
+      track:
+        description: "embedded only: which subtitle track (0 = first)"
+        default: "0"
+      whisper_model:
+        description: "generate only: small (faster) or medium (more accurate, about 2-3x slower)"
+        type: choice
+        options: [small, medium, base]
+        default: small
+
+jobs:
+  subtitles:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+      R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+      BUCKET: ${{ secrets.R2_BUCKET }}
+      SLUG: ${{ inputs.slug }}
+      METHOD: ${{ inputs.method }}
+      SOURCE_KEY: ${{ inputs.source_key }}
+      LANG_CODE: ${{ inputs.language }}
+      TRANSLATE: ${{ inputs.translate_to }}
+      OFFSET: ${{ inputs.offset_seconds }}
+      TRACK: ${{ inputs.track }}
+      WHISPER_MODEL: ${{ inputs.whisper_model }}
+
+    steps:
+      - name: Check inputs
+        run: |
+          [[ "$SLUG" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "::error::Bad slug"; exit 1; }
+          [[ "$LANG_CODE" =~ ^[a-z]{2,3}$|^auto$ ]] || { echo "::error::language should be a code like en, es, fr (or auto)"; exit 1; }
+          [[ "$TRANSLATE" =~ ^[a-z,\ ]*$ ]] || { echo "::error::translate_to should look like es,fr,pt"; exit 1; }
+          [[ "$OFFSET" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || { echo "::error::offset_seconds should be a number like -1.5"; exit 1; }
+          [[ "$TRACK" =~ ^[0-9]+$ ]] || { echo "::error::track should be a number"; exit 1; }
+          [[ "$SOURCE_KEY" != http* ]] || { echo "::error::source_key is just the file name in the bucket, not a web address"; exit 1; }
+          aws s3 ls "s3://$BUCKET/hls/$SLUG/index.m3u8" --endpoint-url "$R2_ENDPOINT" >/dev/null \
+            || { echo "::error::No encoded movie called '$SLUG'. Encode it first, or check the slug."; exit 1; }
+
+      - name: Install tools
+        run: |
+          command -v ffmpeg >/dev/null || (sudo apt-get update -q && sudo apt-get install -y -q ffmpeg)
+          if [[ "$METHOD" == "generate" ]]; then pip install -q faster-whisper; fi
+          if [[ -n "$TRANSLATE" ]]; then pip install -q argostranslate; fi
+
+      - name: Download from R2
+        run: |
+          aws s3 cp "s3://$BUCKET/$SOURCE_KEY" "src_$(basename "$SOURCE_KEY")" --only-show-errors --endpoint-url "$R2_ENDPOINT"
+          echo "SRC=src_$(basename "$SOURCE_KEY")" >> "$GITHUB_ENV"
+          aws s3 cp "s3://$BUCKET/hls/$SLUG/subs/index.json" existing-index.json --only-show-errors \
+            --endpoint-url "$R2_ENDPOINT" 2>/dev/null || echo "(no subtitles yet for this movie)"
+
+      - name: Build subtitles
+        env:
+          OUT: out
+          INDEX: existing-index.json
+        run: |
+          cat > subs.py <<'PYEOF'
+          """Builds WebVTT subtitle files for one movie.
+
+          METHOD=file      SRC is a subtitle file (.srt, .vtt, .ass, .ssa) from a subtitle site
+          METHOD=embedded  SRC is a movie (usually .mkv) with text subtitles inside; TRACK picks which
+          METHOD=generate  SRC is a movie; subtitles are generated from its audio with Whisper
+
+          Writes OUT/<lang>.vtt for the source language and each language in TRANSLATE,
+          and merges them into OUT/index.json (starting from INDEX if it exists).
+          """
+          import json, os, re, subprocess, sys, textwrap, time
+
+          METHOD = os.environ["METHOD"]
+          SRC = os.environ["SRC"]
+          LANG = os.environ.get("LANG_CODE", "auto").strip().lower()
+          TRANSLATE = [c.strip().lower() for c in os.environ.get("TRANSLATE", "").split(",") if c.strip()]
+          OFFSET = float(os.environ.get("OFFSET", "0") or 0)
+          TRACK = int(os.environ.get("TRACK", "0") or 0)
+          MODEL = os.environ.get("WHISPER_MODEL", "small")
+          OUT = os.environ.get("OUT", "out")
+          INDEX = os.environ.get("INDEX", "")
+
+          NAMES = {
+              "en": "English", "es": "Español", "fr": "Français", "de": "Deutsch", "it": "Italiano",
+              "pt": "Português", "nl": "Nederlands", "ru": "Русский", "uk": "Українська", "pl": "Polski",
+              "tr": "Türkçe", "ar": "العربية", "hi": "हिन्दी", "ja": "日本語", "ko": "한국어", "zh": "中文",
+              "id": "Bahasa Indonesia", "vi": "Tiếng Việt", "th": "ไทย", "tl": "Tagalog", "sv": "Svenska",
+          }
+
+
+          def fail(msg):
+              print(f"::error::{msg}")
+              sys.exit(1)
+
+
+          def log(msg):
+              print(msg, flush=True)
+
+
+          # ---------- reading SRT / VTT ----------
+
+          TS = re.compile(r"(?:(\d+):)?(\d{1,2}):(\d{2})[.,](\d{1,3})")
+
+
+          def parse_ts(s):
+              m = TS.search(s)
+              if not m:
+                  raise ValueError(s)
+              h, mi, se, ms = m.groups()
+              return int(h or 0) * 3600 + int(mi) * 60 + int(se) + int(ms.ljust(3, "0")) / 1000
+
+
+          def clean(text):
+              text = re.sub(r"\{\\[^}]*\}", "", text)        # ASS override codes like {\an8}
+              text = re.sub(r"<[^>]+>", "", text)            # <i>, <font ...>, <c.yellow>
+              text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&nbsp;", " ")
+              lines = [ln.strip() for ln in text.replace("\\N", "\n").split("\n")]
+              return "\n".join(ln for ln in lines if ln)
+
+
+          def read_text_file(path):
+              raw = open(path, "rb").read()
+              for enc in ("utf-8-sig", "utf-16"):
+                  try:
+                      text = raw.decode(enc)
+                      if enc == "utf-16" and "-->" not in text:
+                          continue
+                      return text
+                  except UnicodeDecodeError:
+                      pass
+              log("Subtitle file isn't UTF-8; reading it as Windows-1252.")
+              return raw.decode("cp1252", errors="replace")
+
+
+          def parse_subtitles(text):
+              cues = []
+              for block in re.split(r"\n\s*\n", text.replace("\r\n", "\n").replace("\r", "\n")):
+                  lines = block.strip("\n").split("\n")
+                  for i, line in enumerate(lines):
+                      if "-->" in line:
+                          a, b = line.split("-->", 1)
+                          try:
+                              start, end = parse_ts(a), parse_ts(b)
+                          except ValueError:
+                              break
+                          body = clean("\n".join(lines[i + 1:]))
+                          if body and end > start:
+                              cues.append({"start": start, "end": end, "text": body})
+                          break
+              cues.sort(key=lambda c: c["start"])
+              return cues
+
+
+          def ffmpeg_to_srt(args, dest):
+              r = subprocess.run(["ffmpeg", "-v", "error", "-y", *args, "-c:s", "srt", dest], capture_output=True, text=True)
+              return r.returncode == 0 and os.path.exists(dest) and os.path.getsize(dest) > 0, r.stderr.strip()
+
+
+          # ---------- the three methods ----------
+
+          def from_file():
+              ext = os.path.splitext(SRC)[1].lower()
+              if ext in (".srt", ".vtt", ".txt", ""):
+                  return parse_subtitles(read_text_file(SRC))
+              ok, err = ffmpeg_to_srt(["-i", SRC], "converted.srt")
+              if not ok:
+                  fail(f"Couldn't read this subtitle file ({ext}). Use .srt or .vtt if you can. {err}")
+              return parse_subtitles(read_text_file("converted.srt"))
+
+
+          def from_embedded():
+              info = subprocess.run(
+                  ["ffprobe", "-v", "error", "-select_streams", "s", "-show_entries",
+                   "stream=codec_name:stream_tags=language,title", "-of", "json", SRC],
+                  capture_output=True, text=True)
+              streams = json.loads(info.stdout or "{}").get("streams", [])
+              if not streams:
+                  fail("This movie has no subtitle tracks inside it. Use method = file or generate.")
+              log("Subtitle tracks in this movie:")
+              for i, s in enumerate(streams):
+                  tags = s.get("tags", {})
+                  log(f"  track {i}: {tags.get('language', '?')} {tags.get('title', '')} ({s.get('codec_name')})")
+              if TRACK >= len(streams):
+                  fail(f"There is no track {TRACK}. Pick one of the tracks listed above.")
+              if streams[TRACK].get("codec_name") in ("hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle"):
+                  fail(f"Track {TRACK} is picture-based subtitles, which can't be turned into text. "
+                       "Pick a text track, or use method = file or generate.")
+              ok, err = ffmpeg_to_srt(["-i", SRC, "-map", f"0:s:{TRACK}"], "embedded.srt")
+              if not ok:
+                  fail(f"Couldn't extract track {TRACK}: {err}")
+              return parse_subtitles(read_text_file("embedded.srt"))
+
+
+          def cues_from_words(words, max_chars=84, max_secs=6.0):
+              """Groups Whisper's timed words into readable subtitle cues."""
+              cues, cur = [], []
+
+              def flush():
+                  if cur:
+                      cues.append({"start": cur[0].start, "end": cur[-1].end,
+                                   "text": "".join(w.word for w in cur).strip()})
+                      cur.clear()
+
+              for w in words:
+                  if cur:
+                      text_len = len("".join(x.word for x in cur)) + len(w.word)
+                      gap = w.start - cur[-1].end
+                      sentence_end = cur[-1].word.strip()[-1:] in ".?!"
+                      if text_len > max_chars or w.end - cur[0].start > max_secs or gap > 1.0 \
+                              or (sentence_end and text_len > 40):
+                          flush()
+                  cur.append(w)
+              flush()
+              return [c for c in cues if c["text"]]
+
+
+          def from_audio():
+              global LANG
+              log("Extracting audio...")
+              r = subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", SRC, "-map", "0:a:0", "-ac", "1", "-ar", "16000",
+                                  "audio.wav"], capture_output=True, text=True)
+              if r.returncode:
+                  fail(f"Couldn't read the movie's audio: {r.stderr.strip()}")
+              from faster_whisper import WhisperModel
+              log(f"Loading Whisper '{MODEL}'...")
+              model = WhisperModel(MODEL, device="cpu", compute_type="int8", cpu_threads=os.cpu_count() or 2)
+              segments, info = model.transcribe("audio.wav", language=None if LANG == "auto" else LANG,
+                                                vad_filter=True, word_timestamps=True)
+              if LANG == "auto":
+                  LANG = info.language
+                  log(f"Detected language: {LANG} ({info.language_probability:.0%} sure)")
+              words, t0, last_report = [], time.time(), 0
+              for seg in segments:
+                  words.extend(seg.words or [])
+                  if seg.end - last_report >= 300:
+                      last_report = seg.end
+                      speed = seg.end / max(1, time.time() - t0)
+                      log(f">> Transcribed {int(seg.end // 60)} of {int(info.duration // 60)} min  ({speed:.1f}x real time)")
+              return cues_from_words(words)
+
+
+          # ---------- writing ----------
+
+          def fmt(t):
+              t = max(0.0, t)
+              ms = int(round(t * 1000))
+              return f"{ms // 3600000:02d}:{ms // 60000 % 60:02d}:{ms // 1000 % 60:02d}.{ms % 1000:03d}"
+
+
+          def wrap(text, width=42):
+              out = []
+              for line in text.split("\n"):
+                  out.extend(textwrap.wrap(line, width) or [""])
+              return "\n".join(out)
+
+
+          def write_vtt(cues, path):
+              with open(path, "w", encoding="utf-8") as f:
+                  f.write("WEBVTT\n\n")
+                  for c in cues:
+                      f.write(f"{fmt(c['start'])} --> {fmt(c['end'])}\n{wrap(c['text'])}\n\n")
+
+
+          def translate_all(cues, src, targets):
+              import argostranslate.package as pkg
+              import argostranslate.translate as tr
+              log("Loading translation models...")
+              pkg.update_package_index()
+              available = pkg.get_available_packages()
+
+              def install(a, b):
+                  p = next((p for p in available if p.from_code == a and p.to_code == b), None)
+                  if p and not any(x.from_code == a and x.to_code == b for x in pkg.get_installed_packages()):
+                      pkg.install_from_path(p.download())
+                  return p is not None
+
+              results = {}
+              for t in targets:
+                  if t == src:
+                      continue
+                  direct = install(src, t)
+                  if not direct and not (install(src, "en") and install("en", t)):
+                      print(f"::warning::No free translation model for {src} -> {t}; skipping {t}.")
+                      continue
+                  log(f"Translating {src} -> {t} ({len(cues)} lines)...")
+                  t0, memo, out = time.time(), {}, []
+                  for i, c in enumerate(cues):
+                      key = c["text"].replace("\n", " ")
+                      if key not in memo:
+                          memo[key] = tr.translate(key, src, t)
+                      out.append({**c, "text": memo[key]})
+                      if i and i % 300 == 0:
+                          log(f"   {i}/{len(cues)} lines ({time.time() - t0:.0f}s)")
+                  results[t] = out
+              return results
+
+
+          def main():
+              os.makedirs(OUT, exist_ok=True)
+              if METHOD != "generate" and LANG == "auto":
+                  fail("Set 'language' to the language of the subtitles (e.g. en). 'auto' only works with generate.")
+
+              cues = {"file": from_file, "embedded": from_embedded, "generate": from_audio}[METHOD]()
+              if not cues:
+                  fail("No subtitle lines were found.")
+              if OFFSET:
+                  log(f"Shifting all lines by {OFFSET:+.2f}s")
+                  cues = [{**c, "start": c["start"] + OFFSET, "end": c["end"] + OFFSET} for c in cues]
+                  cues = [c for c in cues if c["end"] > 0]
+              log(f"{len(cues)} lines, from {fmt(cues[0]['start'])} to {fmt(cues[-1]['end'])}")
+
+              made = {LANG: (cues, "generated" if METHOD == "generate" else METHOD)}
+              if TRANSLATE:
+                  for code, tcues in translate_all(cues, LANG, TRANSLATE).items():
+                      made[code] = (tcues, "translated")
+
+              index = {"languages": []}
+              if INDEX and os.path.exists(INDEX):
+                  try:
+                      index = json.load(open(INDEX, encoding="utf-8"))
+                  except ValueError:
+                      pass
+              langs = [l for l in index.get("languages", []) if l.get("code") not in made]
+              for code, (c, source) in made.items():
+                  write_vtt(c, os.path.join(OUT, f"{code}.vtt"))
+                  langs.append({"code": code, "name": NAMES.get(code, code), "file": f"{code}.vtt", "source": source})
+                  log(f"Wrote {code}.vtt ({source})")
+              index["languages"] = langs
+              with open(os.path.join(OUT, "index.json"), "w", encoding="utf-8") as f:
+                  json.dump(index, f, ensure_ascii=False, indent=1)
+              log("Languages now available: " + ", ".join(l["code"] for l in langs))
+
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+          python3 subs.py
+
+      - name: Upload to R2
+        run: |
+          DEST="s3://$BUCKET/hls/$SLUG/subs/"
+          for f in out/*.vtt; do
+            aws s3 cp "$f" "$DEST" --content-type "text/vtt; charset=utf-8" --cache-control "public, max-age=300" \
+              --only-show-errors --endpoint-url "$R2_ENDPOINT"
+          done
+          aws s3 cp out/index.json "$DEST" --content-type application/json --cache-control no-cache \
+            --only-show-errors --endpoint-url "$R2_ENDPOINT"
+          echo "::notice::Subtitles ready: $(python3 -c "import json;print(', '.join(l['code'] for l in json.load(open('out/index.json'))['languages']))")"
