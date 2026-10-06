@@ -1,8 +1,17 @@
-# Put this file at .github/workflows/encode-hls.yml in your repo.
-# Run it from the Actions tab -> "Encode movie to HLS" -> Run workflow.
+# .github/workflows/encode-hls.yml
 #
-# Required repo secrets (Settings -> Secrets and variables -> Actions):
-#   R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET
+# Encodes a movie from R2 into HLS segments and uploads them WHILE it works,
+# so a showing can start a minute or two after you press Run.
+#
+#   mode = fast    Re-packages your H.264/AAC file without re-encoding.
+#                  Whole movie in a few minutes, same quality as the original.
+#                  Segment lengths follow the file's own keyframes (often 2-10 s).
+#   mode = encode  Full re-encode at the chosen height with exact 4 s segments.
+#                  Slower (about 2-4x real time on a public repo), smaller files,
+#                  tighter sync. Upload runs alongside, so you can still start early.
+#
+# Required repo secrets: R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET
+# Optional (for autoplay): WORKER_URL (e.g. https://movie-live.you.workers.dev), WORKER_ADMIN_KEY
 
 name: Encode movie to HLS
 
@@ -10,17 +19,30 @@ on:
   workflow_dispatch:
     inputs:
       source_key:
-        description: "Path of the MP4 inside your R2 bucket (e.g. movies/mymovie.mp4)"
+        description: "File name inside your R2 bucket (e.g. mymovie.mp4) - NOT the full web address"
         required: true
       slug:
-        description: "Output folder name, letters/numbers/-/_ only (e.g. mymovie)"
+        description: "Short name for this movie, letters/numbers/-/_ only (e.g. mymovie)"
         required: true
+      mode:
+        description: "fast = no re-encode (minutes). encode = full re-encode (slower, exact segments)"
+        type: choice
+        options: [fast, encode]
+        default: fast
       height:
-        description: "Output height: 720, 1080, or source"
+        description: "encode mode only: 720, 1080, or source"
         default: "720"
       segment_seconds:
-        description: "Segment length in seconds (smaller = tighter sync, more playlist requests)"
+        description: "Target segment length in seconds"
         default: "4"
+      autoplay:
+        description: "Start the showing automatically as soon as it's safe (needs WORKER_URL and WORKER_ADMIN_KEY secrets)"
+        type: boolean
+        default: false
+      overwrite:
+        description: "Replace a movie that already uses this slug"
+        type: boolean
+        default: false
 
 jobs:
   encode:
@@ -30,59 +52,146 @@ jobs:
       AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: auto
-      # Needed for R2 with recent AWS CLI versions
       AWS_REQUEST_CHECKSUM_CALCULATION: when_required
       AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
       R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
       BUCKET: ${{ secrets.R2_BUCKET }}
-      # Inputs passed via env (not inlined into scripts) to avoid shell injection
+      WORKER_URL: ${{ secrets.WORKER_URL }}
+      WORKER_ADMIN_KEY: ${{ secrets.WORKER_ADMIN_KEY }}
       SOURCE_KEY: ${{ inputs.source_key }}
       SLUG: ${{ inputs.slug }}
+      MODE: ${{ inputs.mode }}
       HEIGHT: ${{ inputs.height }}
       SEG: ${{ inputs.segment_seconds }}
+      AUTOPLAY: ${{ inputs.autoplay }}
+      OVERWRITE: ${{ inputs.overwrite }}
 
     steps:
-      - name: Validate inputs
+      - name: Check inputs
         run: |
-          [[ "$SLUG" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "Bad slug"; exit 1; }
-          [[ "$SEG" =~ ^[0-9]+$ ]] || { echo "Bad segment_seconds"; exit 1; }
-          [[ "$HEIGHT" =~ ^([0-9]+|source)$ ]] || { echo "Bad height"; exit 1; }
+          [[ "$SLUG" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "::error::Slug can only use letters, numbers, - and _"; exit 1; }
+          [[ "$SEG" =~ ^[0-9]+$ && "$SEG" -ge 1 ]] || { echo "::error::segment_seconds must be a whole number"; exit 1; }
+          [[ "$HEIGHT" =~ ^([0-9]+|source)$ ]] || { echo "::error::height must be a number or 'source'"; exit 1; }
+          if [[ "$SOURCE_KEY" == http* ]]; then
+            echo "::error::source_key should be just the file name inside the bucket (e.g. mymovie.mp4), not a web address"; exit 1
+          fi
+          if [[ "$AUTOPLAY" == "true" && ( -z "$WORKER_URL" || -z "$WORKER_ADMIN_KEY" ) ]]; then
+            echo "::error::autoplay needs the WORKER_URL and WORKER_ADMIN_KEY repo secrets"; exit 1
+          fi
+
+      - name: Check the slug is free
+        run: |
+          if aws s3 ls "s3://$BUCKET/hls/$SLUG/index.m3u8" --endpoint-url "$R2_ENDPOINT" >/dev/null 2>&1; then
+            if [[ "$OVERWRITE" == "true" ]]; then
+              echo "Removing the old hls/$SLUG/ ..."
+              aws s3 rm "s3://$BUCKET/hls/$SLUG/" --recursive --only-show-errors --endpoint-url "$R2_ENDPOINT"
+            else
+              echo "::error::hls/$SLUG/ already exists. Pick a new slug, or tick 'overwrite' to replace it."; exit 1
+            fi
+          fi
 
       - name: Install ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+        run: command -v ffmpeg >/dev/null || (sudo apt-get update -q && sudo apt-get install -y -q ffmpeg)
 
       - name: Download source from R2
-        run: aws s3 cp "s3://$BUCKET/$SOURCE_KEY" source.mp4 --endpoint-url "$R2_ENDPOINT"
-
-      - name: Encode to HLS
         run: |
-          mkdir -p out
-          if [ "$HEIGHT" = "source" ]; then VF=(); else VF=(-vf "scale=-2:$HEIGHT"); fi
-          # Keyframes are forced exactly every $SEG seconds so every segment
-          # has the same length. The Worker relies on that for its timing math.
-          ffmpeg -hide_banner -y -i source.mp4 "${VF[@]}" \
-            -c:v libx264 -preset superfast -crf 21 -profile:v high -pix_fmt yuv420p \
-            -force_key_frames "expr:gte(t,n_forced*$SEG)" -sc_threshold 0 \
-            -c:a aac -b:a 128k -ac 2 -ar 48000 \
-            -f hls -hls_time "$SEG" -hls_playlist_type vod \
-            -hls_flags independent_segments \
-            -hls_segment_filename "out/seg_%05d.ts" \
-            out/index.m3u8
+          EXT="${SOURCE_KEY##*.}"; [[ "$EXT" == "$SOURCE_KEY" ]] && EXT=mp4
+          aws s3 cp "s3://$BUCKET/$SOURCE_KEY" "source.$EXT" --only-show-errors --endpoint-url "$R2_ENDPOINT"
+          echo "SRC=source.$EXT" >> "$GITHUB_ENV"
+          ls -lh "source.$EXT"
 
-      - name: Write meta.json
+      - name: Encode and upload as it goes
         run: |
-          COUNT=$(ls out/seg_*.ts | wc -l)
-          LAST=$(grep '^#EXTINF' out/index.m3u8 | tail -1 | sed 's/#EXTINF:\([0-9.]*\).*/\1/')
-          echo "{\"segmentSeconds\": $SEG, \"count\": $COUNT, \"lastSeconds\": $LAST}" > out/meta.json
-          cat out/meta.json
-
-      - name: Upload to R2
-        run: |
+          set -uo pipefail
           DEST="s3://$BUCKET/hls/$SLUG/"
-          aws s3 cp out/ "$DEST" --recursive --exclude "*" --include "*.ts" \
-            --content-type video/mp2t --endpoint-url "$R2_ENDPOINT"
-          aws s3 cp out/index.m3u8 "$DEST" \
-            --content-type application/vnd.apple.mpegurl --endpoint-url "$R2_ENDPOINT"
-          aws s3 cp out/meta.json "$DEST" \
-            --content-type application/json --endpoint-url "$R2_ENDPOINT"
-          echo "Uploaded to hls/$SLUG/"
+          mkdir -p out
+
+          probe() { ffprobe -v error -select_streams "$1" -show_entries "stream=$2" -of csv=p=0 "$SRC" | head -1; }
+          DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$SRC")
+          VCODEC=$(probe v:0 codec_name); PIXFMT=$(probe v:0 pix_fmt); ACODEC=$(probe a:0 codec_name || true)
+          echo "Source: video=$VCODEC ($PIXFMT) audio=${ACODEC:-none} length=${DUR}s"
+
+          if [[ "$MODE" == "fast" ]]; then
+            if [[ "$VCODEC" != "h264" || "$PIXFMT" == *10* ]]; then
+              echo "::error::Fast mode needs 8-bit H.264 video, but this file is $VCODEC ($PIXFMT). Run again with mode = encode."; exit 1
+            fi
+            VIDEO=(-c:v copy)
+            if [[ "$ACODEC" == "aac" ]]; then AUDIO=(-c:a copy); else AUDIO=(-c:a aac -b:a 160k -ac 2 -ar 48000); fi
+          else
+            if [[ "$HEIGHT" == "source" ]]; then VF=(); else VF=(-vf "scale=-2:$HEIGHT"); fi
+            VIDEO=("${VF[@]}" -c:v libx264 -preset veryfast -crf 21 -profile:v high -pix_fmt yuv420p
+                   -force_key_frames "expr:gte(t,n_forced*$SEG)" -sc_threshold 0)
+            AUDIO=(-c:a aac -b:a 128k -ac 2 -ar 48000)
+          fi
+
+          write_meta() {  # $1 = complete (true/false), $2 = duration
+            printf '{"version": 2, "mode": "%s", "targetSeconds": %s, "duration": %s, "complete": %s}\n' \
+              "$MODE" "$SEG" "$2" "$1" > out/meta.json
+            aws s3 cp out/meta.json "${DEST}meta.json" --content-type application/json \
+              --cache-control no-cache --only-show-errors --endpoint-url "$R2_ENDPOINT"
+          }
+
+          # Sum of segment lengths in a playlist = how much of the movie is ready.
+          ready_seconds() { awk -F'[:,]' '/^#EXTINF/ {s+=$2} END {printf "%.0f", s+0}' "$1"; }
+          fmt() { printf '%d:%02d:%02d' $(($1/3600)) $(($1%3600/60)) $(($1%60)); }
+
+          # Copy the playlist first, then every finished segment, then the playlist.
+          # So viewers never get a playlist pointing at a segment that isn't uploaded yet.
+          sync_up() {
+            [[ -f out/index.m3u8 ]] || return 1
+            cp out/index.m3u8 out/snapshot.m3u8
+            aws s3 sync out/ "$DEST" --exclude "*" --include "seg_*.ts" --content-type video/mp2t \
+              --cache-control "public, max-age=600" --only-show-errors --endpoint-url "$R2_ENDPOINT" || return 1
+            aws s3 cp out/snapshot.m3u8 "${DEST}index.m3u8" --content-type application/vnd.apple.mpegurl \
+              --cache-control no-cache --only-show-errors --endpoint-url "$R2_ENDPOINT" || return 1
+          }
+
+          ffmpeg -hide_banner -nostdin -loglevel warning -stats -stats_period 15 -y -i "$SRC" \
+            -map 0:v:0 -map "0:a:0?" "${VIDEO[@]}" "${AUDIO[@]}" \
+            -f hls -hls_time "$SEG" -hls_playlist_type event \
+            -hls_flags independent_segments+temp_file \
+            -hls_segment_filename "out/seg_%05d.ts" out/index.m3u8 &
+          FF=$!
+
+          START=$(date +%s); META_SENT=0; READY=0; WARNED=0
+          TOTAL=${DUR%.*}
+          while kill -0 "$FF" 2>/dev/null; do
+            for _ in $(seq 15); do kill -0 "$FF" 2>/dev/null || break; sleep 1; done
+            kill -0 "$FF" 2>/dev/null || break
+            sync_up || { echo "(upload will retry)"; continue; }
+            [[ $META_SENT == 1 ]] || { write_meta false "$DUR" && META_SENT=1; }
+
+            DONE=$(ready_seconds out/snapshot.m3u8); WALL=$(( $(date +%s) - START ))
+            SPEED=$(awk -v d="$DONE" -v w="$WALL" 'BEGIN {printf "%.1f", (w>0 ? d/w : 0)}')
+            echo ">> Uploaded $(fmt "$DONE") of $(fmt "$TOTAL")  (${SPEED}x real time)"
+
+            if (( WALL >= 60 )) && awk -v s="$SPEED" 'BEGIN {exit !(s < 1.2)}' && (( WARNED == 0 )); then
+              echo "::warning::Encoding at only ${SPEED}x real time. Viewers may catch up to it and buffer. Wait for it to finish before starting, or use fast mode."
+              WARNED=1
+            fi
+            # Safe to start: 1 minute ready, and running clearly faster than playback.
+            if (( READY == 0 && DONE >= 60 && WALL >= 30 )) && awk -v s="$SPEED" 'BEGIN {exit !(s >= 1.2)}'; then
+              READY=1
+              echo "::notice::READY - safe to start the showing now (movie=$SLUG)"
+              if [[ "$AUTOPLAY" == "true" ]]; then
+                curl -fsS "$WORKER_URL/play?movie=$SLUG&key=$WORKER_ADMIN_KEY" && echo "::notice::Autoplay started the showing" \
+                  || echo "::warning::Autoplay request failed. Start it with your /play link."
+              fi
+            fi
+          done
+
+          wait "$FF"; CODE=$?
+          if (( CODE != 0 )); then echo "::error::ffmpeg failed (exit $CODE). See the log above."; exit "$CODE"; fi
+
+          # Final upload with the finished playlist, then mark the movie complete.
+          OK=0; for i in 1 2 3; do if sync_up; then OK=1; break; fi; sleep 5; done
+          (( OK == 1 )) || { echo "::error::Final upload failed"; exit 1; }
+          FINAL=$(awk -F'[:,]' '/^#EXTINF/ {s+=$2} END {printf "%.3f", s}' out/index.m3u8)
+          write_meta true "$FINAL"
+          COUNT=$(ls out/seg_*.ts | wc -l)
+          MAXSEG=$(awk -F'[:,]' '/^#EXTINF/ {if ($2>m) m=$2} END {printf "%.1f", m}' out/index.m3u8)
+          echo "Done: $COUNT segments (longest ${MAXSEG}s) uploaded to hls/$SLUG/ in $(( $(date +%s) - START ))s"
+          if (( READY == 0 )); then
+            echo "::notice::READY - finished, safe to start the showing (movie=$SLUG)"
+            if [[ "$AUTOPLAY" == "true" ]]; then curl -fsS "$WORKER_URL/play?movie=$SLUG&key=$WORKER_ADMIN_KEY" || true; fi
+          fi
