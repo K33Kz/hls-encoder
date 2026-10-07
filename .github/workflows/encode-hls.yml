@@ -1,928 +1,245 @@
-// Cloudflare Worker: one fixed live link for the movie room.
-//
-//   /live                          -> the stream (put this in AVPro). Everyone stays in sync.
-//   /dvr                           -> the same stream with rewind history, so a player can scrub back on their own
-//   /play?movie=<slug>&key=<key>   -> admin: start a movie. &countdown=30 adds a countdown clip first,
-//                                     &at=<unix seconds> schedules it (a 60 s countdown plays before it starts)
-//   /seek?to=<seconds>&key=<key>   -> admin: move everyone to a point in the movie (&by=-30 jumps relative)
-//   /stop?key=<key>                -> admin: end the showing
-//   /status                        -> what's playing (plain text)
-//   /now                           -> the same as JSON for game scripts: phase, position, countdown, viewers, subtitles
-//   /up/start, /up/part, /up/complete, /up/abort -> admin: upload files to R2 from the Booth
-//   /subs/find, /subs/langs, /subs/pack          -> admin: the Booth's subtitle finder (SubDL)
-//   /gh/files, /gh/dispatch, /gh/runs, /gh/run   -> admin: the Booth's Encoder (GitHub Actions) and movie library
-//
-// Needs: KV binding MOVIE_STATE, secret ADMIN_KEY.
-// Optional: R2 binding MOVIES (library, uploads, viewer count, saving subtitle packs),
-//           secret SUBDL_API_KEY (subtitle finder), secret GITHUB_TOKEN (Encoder).
-
-const R2_PUBLIC_BASE = "https://pub-4e8b4bc9b0de4ce79e0b0a0e2021fba8.r2.dev";
-
-const WINDOW = 6;               // at least this many segments in the live playlist...
-const WINDOW_TARGETS = 5;       // ...and at least this many target durations of video, so strict players can start
-const HOLD_TARGETS = 3;         // players start this many target durations behind live (Apple's HLS rule)
-const MIN_SEGMENTS_TO_PLAY = 3; // /play refuses until at least this many are uploaded
-const MAX_COUNTDOWN = 60;       // seconds; the countdown clip is 60 s long
-const MAX_SCHEDULE_DAYS = 7;
-
-const CORS = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, PUT, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
-};
-
-function text(message, status = 200) {
-  return new Response(message + "\n", {
-    status,
-    headers: { ...CORS, "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" },
-  });
-}
-
-function json(data, status = 200) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { ...CORS, "Content-Type": "application/json", "Cache-Control": "no-store" },
-  });
-}
-
-function formatTime(seconds) {
-  const s = Math.max(0, Math.floor(seconds));
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  return `${h}:${String(m).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
-}
-
-// ---------- Movie info (meta.json + index.m3u8), cached briefly in memory ----------
-
-const movieCache = new Map();
-
-function parsePlaylist(body) {
-  const segs = [];
-  let dur = null;
-  let t = 0;
-  for (const raw of body.split("\n")) {
-    const line = raw.trim();
-    if (line.startsWith("#EXTINF:")) {
-      dur = parseFloat(line.slice(8));
-    } else if (line && !line.startsWith("#") && dur !== null) {
-      segs.push({ uri: line, dur, start: t });
-      t += dur;
-      dur = null;
-    }
-  }
-  return { segs, ended: body.includes("#EXT-X-ENDLIST") };
-}
-
-async function loadMovie(movie) {
-  const hit = movieCache.get(movie);
-  if (hit && Date.now() - hit.at < (hit.data.complete ? 300000 : 4000)) return hit.data;
-
-  const base = `${R2_PUBLIC_BASE}/hls/${movie}`;
-  const metaRes = await fetch(`${base}/meta.json`, { cf: { cacheTtl: 5, cacheEverything: true } });
-  if (!metaRes.ok) return null;
-  const meta = await metaRes.json();
-  const markedComplete = meta.version >= 2 ? meta.complete === true : true; // old movies are always complete
-
-  const plRes = await fetch(`${base}/index.m3u8`, {
-    cf: { cacheTtl: markedComplete ? 300 : 3, cacheEverything: true },
-  });
-  if (!plRes.ok) return null;
-  const { segs, ended } = parsePlaylist(await plRes.text());
-
-  const complete = markedComplete && ended;
-  const uploaded = segs.length ? segs[segs.length - 1].start + segs[segs.length - 1].dur : 0;
-  const longest = segs.reduce((m, s) => Math.max(m, s.dur), meta.targetSeconds || meta.segmentSeconds || 4);
-
-  const data = {
-    movie,
-    title: meta.title || movie,
-    base,
-    segs,
-    complete,
-    uploaded,                                         // seconds of movie uploaded so far
-    duration: complete ? uploaded : meta.duration || uploaded,
-    targetDuration: Math.ceil(longest),
-  };
-  movieCache.set(movie, { at: Date.now(), data });
-  return data;
-}
-
-// The countdown clip made by the encode workflow: hls/<slug>/intro/, or the shared hls/_intro/.
-const introCache = new Map();
-
-async function loadIntro(src) {
-  const hit = introCache.get(src);
-  if (hit && Date.now() - hit.at < (hit.data ? 300000 : 60000)) return hit.data;
-  const base = src === "_intro" ? `${R2_PUBLIC_BASE}/hls/_intro` : `${R2_PUBLIC_BASE}/hls/${src}/intro`; // shared clip lives at hls/_intro/
-  let data = null;
-  try {
-    const r = await fetch(`${base}/index.m3u8`, { cf: { cacheTtl: 300, cacheEverything: true } });
-    if (r.ok) {
-      const { segs } = parsePlaylist(await r.text());
-      if (segs.length) {
-        const last = segs[segs.length - 1];
-        data = { src, base, segs, L: last.start + last.dur };
-      }
-    }
-  } catch { /* no intro */ }
-  introCache.set(src, { at: Date.now(), data });
-  return data;
-}
-
-async function findIntro(movie) {
-  return (await loadIntro(movie)) || (await loadIntro("_intro"));
-}
-
-// Number of segments whose end is at or before `t` seconds.
-function airedCount(segs, t) {
-  let lo = 0, hi = segs.length;
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    if (segs[mid].start + segs[mid].dur <= t) lo = mid + 1;
-    else hi = mid;
-  }
-  return lo;
-}
-
-// Index of the segment playing at `t` seconds.
-function segmentAt(segs, t) {
-  let lo = 0, hi = segs.length - 1, found = 0;
-  while (lo <= hi) {
-    const mid = (lo + hi) >> 1;
-    if (segs[mid].start <= t) { found = mid; lo = mid + 1; } else hi = mid - 1;
-  }
-  return found;
-}
-
-// Longest segment length a playlist for this movie (and countdown clip) can contain.
-function targetOf(movie, intro) {
-  return Math.ceil(Math.max(movie.targetDuration, ...(intro ? intro.segs.map((s) => s.dur) : []), 1));
-}
-
-// Seconds of video from segment k onward that add up to at least `need` (capped at what's uploaded).
-function leadFrom(segs, k, need) {
-  let sum = 0;
-  for (let i = k; i < segs.length && sum < need; i++) sum += segs[i].dur;
-  return sum;
-}
-
-// ---------- Showing state (KV), cached briefly in memory ----------
-//
-// A showing is a timeline: an optional piece of the countdown clip, then the movie from segment k0.
-// `start` is the wall-clock time (unix seconds) at which movie time 0 would play.
-// Segment numbers (seqBase) keep counting up across starts and jumps so players can follow without reloading.
-
-let stateCache = { at: 0, value: null };
-
-function normalize(s) {
-  if (!s) return null;
-  return { v: 3, k0: 0, intro: null, seqBase: 0, discBase: 0, ver: 0, at: null, ...s };
-}
-
-async function getState(env, fresh = false) {
-  if (!fresh && Date.now() - stateCache.at < 4000) return stateCache.value;
-  const value = normalize(await env.MOVIE_STATE.get("now", { type: "json", cacheTtl: 30 }));
-  stateCache = { at: Date.now(), value };
-  return value;
-}
-
-async function setState(env, value) {
-  await env.MOVIE_STATE.put("now", JSON.stringify(value));
-  stateCache = { at: Date.now(), value: normalize(value) };
-}
-
-const isActive = (st) => !!(st && !st.stopped && st.movie);
-
-function timeline(st, movie, intro, now) {
-  const segs = movie.segs, N = segs.length;
-  const k0 = Math.min(st.k0 || 0, N);
-  const movieBegin = st.start + (k0 < N ? segs[k0].start : movie.uploaded);
-  const introSegs = [];
-  if (st.intro && intro) {
-    for (const s of intro.segs) {
-      if (s.start >= st.intro.from - 0.01) {
-        introSegs.push({ url: `${intro.base}/${s.uri}`, dur: s.dur, wallStart: movieBegin - (intro.L - s.start) });
-      }
-    }
-  }
-  const I = introSegs.length;
-  let introAired = 0;
-  while (introAired < I && introSegs[introAired].wallStart + introSegs[introAired].dur <= now) introAired++;
-  const movieAired = introAired === I ? Math.max(0, airedCount(segs, now - st.start) - k0) : 0;
-  return {
-    segs, N, k0, introSegs, I, introAired, movieAired, A: introAired + movieAired, movieBegin,
-    streamBegin: I ? introSegs[0].wallStart : movieBegin,
-  };
-}
-
-function segAt(tl, movie, st, j) {
-  if (j < tl.I) return tl.introSegs[j];
-  const s = tl.segs[tl.k0 + j - tl.I];
-  return { url: `${movie.base}/${s.uri}`, dur: s.dur, wallStart: st.start + s.start };
-}
-
-// Positions in the timeline that start a new piece (marked as discontinuities).
-function pieceStarts(tl, st) {
-  const out = [];
-  if ((st.seqBase || 0) > 0) out.push(0);
-  if (tl.I > 0 && !out.includes(tl.I)) out.push(tl.I);
-  return out;
-}
-
-function phaseOf(st, movie, tl, now) {
-  if (!isActive(st)) return "idle";
-  if (!movie) return "missing";
-  if (now < tl.streamBegin) return "scheduled";
-  if (now < tl.movieBegin) return "countdown";
-  if (movie.complete && now - st.start >= movie.duration) return "ended";
-  return "playing";
-}
-
-function buildPlaylist(st, movie, intro, now, dvr) {
-  const tl = timeline(st, movie, intro, now);
-  if (tl.A < 1) {
-    return now < tl.streamBegin
-      ? text(`scheduled: starts in ${formatTime(tl.movieBegin - now)}`, 404)
-      : text("starting, try again in a few seconds", 404);
-  }
-  const starts = pieceStarts(tl, st);
-  const target = Math.ceil(Math.max(movie.targetDuration, ...tl.introSegs.map((s) => s.dur), 1));
-  let first = 0;
-  if (!dvr) {   // walk back until the window is long enough for any player to find a start point
-    let sum = 0;
-    first = tl.A;
-    while (first > 0 && (tl.A - first < WINDOW || sum < WINDOW_TARGETS * target)) sum += segAt(tl, movie, st, --first).dur;
-  }
-  const lines = [
-    "#EXTM3U",
-    "#EXT-X-VERSION:3",
-    `#EXT-X-TARGETDURATION:${target}`,
-    `#EXT-X-MEDIA-SEQUENCE:${(st.seqBase || 0) + first}`,
-    `#EXT-X-DISCONTINUITY-SEQUENCE:${(st.discBase || 0) + starts.filter((j) => j < first).length}`,
-    "#EXT-X-INDEPENDENT-SEGMENTS",
-  ];
-  for (let j = first; j < tl.A; j++) {
-    const s = segAt(tl, movie, st, j);
-    if (starts.includes(j)) lines.push("#EXT-X-DISCONTINUITY");
-    if (j === first || starts.includes(j)) {
-      lines.push(`#EXT-X-PROGRAM-DATE-TIME:${new Date(s.wallStart * 1000).toISOString()}`);
-    }
-    lines.push(`#EXTINF:${s.dur.toFixed(3)},`);
-    lines.push(s.url);
-  }
-  if (movie.complete && tl.introAired === tl.I && tl.movieAired === tl.N - tl.k0) lines.push("#EXT-X-ENDLIST");
-  return new Response(lines.join("\n") + "\n", {
-    headers: { ...CORS, "Content-Type": "application/vnd.apple.mpegurl", "Cache-Control": "no-cache, no-store" },
-  });
-}
-
-// Numbers for the next showing: continue after whatever the current one has aired.
-async function continuation(env, now) {
-  const st = await getState(env, true);
-  if (!st) return { seqBase: 0, discBase: 0, ver: 1 };
-  let aired = 0;
-  if (isActive(st)) {
-    const m = await loadMovie(st.movie).catch(() => null);
-    if (m) {
-      const intro = st.intro ? await loadIntro(st.intro.src) : null;
-      aired = timeline(st, m, intro, now).A;
-    }
-  }
-  return { seqBase: (st.seqBase || 0) + aired, discBase: (st.discBase || 0) + 2, ver: (st.ver || 0) + 1 };
-}
-
-// ---------- Viewer count ----------
-// Each Worker instance remembers which viewers (a short hash of IP + device) loaded the stream in the
-// last 90 s, and every 30 s writes that list to R2 under viewers/. The count merges the fresh lists.
-
-const INSTANCE = Math.random().toString(36).slice(2, 10);
-const seen = new Map();
-let lastFlush = 0;
-let viewerCount = { at: 0, value: null };
-
-async function noteViewer(request, env) {
-  const ip = request.headers.get("CF-Connecting-IP");
-  if (!env.MOVIES || !ip) return;
-  const who = ip + "|" + (request.headers.get("User-Agent") || "");
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(who));
-  const id = [...new Uint8Array(digest).slice(0, 5)].map((b) => b.toString(16).padStart(2, "0")).join("");
-  const nowMs = Date.now();
-  seen.set(id, nowMs);
-  if (nowMs - lastFlush < 30000) return;
-  lastFlush = nowMs;
-  for (const [k, t] of seen) if (nowMs - t > 90000) seen.delete(k);
-  await env.MOVIES.put(`viewers/${INSTANCE}.json`, JSON.stringify({ at: nowMs, ids: [...seen.keys()] }));
-}
-
-async function countViewers(env, waitUntil) {
-  if (!env.MOVIES) return null;
-  if (Date.now() - viewerCount.at < 20000) return viewerCount.value;
-  try {
-    const list = await env.MOVIES.list({ prefix: "viewers/", limit: 500 });
-    const nowMs = Date.now(), ids = new Set(), stale = [];
-    const fresh = list.objects.filter((o) => {
-      const age = nowMs - new Date(o.uploaded).getTime();
-      if (age > 600000) stale.push(o.key);
-      return age < 75000;
-    });
-    const bodies = await Promise.all(fresh.map((o) => env.MOVIES.get(o.key).then((r) => (r ? r.json() : null)).catch(() => null)));
-    for (const b of bodies) if (b && Array.isArray(b.ids)) b.ids.forEach((i) => ids.add(i));
-    if (stale.length && waitUntil) waitUntil(env.MOVIES.delete(stale));
-    viewerCount = { at: nowMs, value: ids.size };
-  } catch {
-    viewerCount = { at: Date.now(), value: viewerCount.value };
-  }
-  return viewerCount.value;
-}
-
-// ---------- Uploads to R2 (in 50 MB pieces, so big movies fit through the Worker) ----------
-
-const UPLOAD_PART = 50 * 1024 * 1024;
-const SAFE_NAME = /^(?!hls\/|viewers\/)(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._()\-\/]{0,199}$/;
-const TYPES = { mp4: "video/mp4", m4v: "video/mp4", mkv: "video/x-matroska", mov: "video/quicktime", webm: "video/webm",
-  avi: "video/x-msvideo", ts: "video/mp2t", srt: "application/x-subrip", vtt: "text/vtt", ass: "text/plain", ssa: "text/plain",
-  zip: "application/zip", mks: "video/x-matroska" };
-
-async function uploadRoutes(path, request, url, env) {
-  if (!env.ADMIN_KEY || url.searchParams.get("key") !== env.ADMIN_KEY) return json({ error: "wrong or missing key" }, 403);
-  if (!env.MOVIES) return json({ error: "Uploading needs the MOVIES R2 binding on the Worker." }, 501);
-  const name = url.searchParams.get("name") || "";
-  if (!SAFE_NAME.test(name)) return json({ error: "File names can use letters, numbers, . _ - ( ) and /, with no spaces." }, 400);
-  try {
-    if (path === "/up/start") {
-      if (request.method !== "POST") return json({ error: "Use POST." }, 405);
-      if (url.searchParams.get("overwrite") !== "1" && (await env.MOVIES.head(name))) {
-        return json({ error: `"${name}" is already in R2. Tick "Replace" to overwrite it.`, exists: true }, 409);
-      }
-      const ext = (name.split(".").pop() || "").toLowerCase();
-      const mp = await env.MOVIES.createMultipartUpload(name, { httpMetadata: { contentType: TYPES[ext] || "application/octet-stream" } });
-      return json({ uploadId: mp.uploadId, partSize: UPLOAD_PART });
-    }
-    const uploadId = url.searchParams.get("uploadId") || "";
-    if (!uploadId) return json({ error: "Missing uploadId." }, 400);
-    const mp = env.MOVIES.resumeMultipartUpload(name, uploadId);
-    if (path === "/up/part") {
-      if (request.method !== "PUT") return json({ error: "Use PUT." }, 405);
-      const n = parseInt(url.searchParams.get("n") || "", 10);
-      if (!(n >= 1 && n <= 10000) || !request.body) return json({ error: "Bad part." }, 400);
-      const part = await mp.uploadPart(n, request.body);
-      return json({ partNumber: part.partNumber, etag: part.etag });
-    }
-    if (path === "/up/complete") {
-      const body = await request.json().catch(() => null);
-      const parts = body && Array.isArray(body.parts) ? body.parts.filter((p) => p && p.partNumber && p.etag) : [];
-      if (!parts.length) return json({ error: "No parts to finish." }, 400);
-      parts.sort((a, b) => a.partNumber - b.partNumber);
-      const obj = await mp.complete(parts);
-      return json({ ok: true, key: obj.key, size: obj.size });
-    }
-    if (path === "/up/abort") {
-      await mp.abort();
-      return json({ ok: true });
-    }
-  } catch (e) {
-    return json({ error: `R2 said: ${(e && e.message) || e}` }, 502);
-  }
-  return json({ error: "unknown upload route" }, 404);
-}
-
-// ---------- Subtitle finder (SubDL) ----------
-// Needs a secret named SUBDL_API_KEY. Optional R2 binding named MOVIES enables "save to R2".
-
-const SUBDL_API = "https://api.subdl.com/api/v1/subtitles";
-const SUBDL_DL = "https://dl.subdl.com";
-const COMMON_LANGS = ["EN", "ES", "FR", "DE", "IT", "PT", "BR_PT", "NL", "PL", "RU", "TR", "AR", "JA", "KO", "ZH", "ID"];
-const MAX_PACK_LANGS = 10;  // keeps each pack inside the free plan's 50 outside requests
-const SUB_EXT_ORDER = [".srt", ".vtt", ".ass", ".ssa"];
-
-// SubDL code -> the code used in file names (the subtitles workflow reads these).
-function fileCode(code) {
-  const c = String(code || "").toUpperCase();
-  if (c === "BR_PT") return "pt-br";
-  if (c === "ZH_BG") return "zh-tw";
-  return c.toLowerCase();
-}
-
-async function subdl(env, params) {
-  const u = new URL(SUBDL_API);
-  u.searchParams.set("api_key", env.SUBDL_API_KEY);
-  for (const [k, v] of Object.entries(params)) if (v !== undefined && v !== "") u.searchParams.set(k, String(v));
-  let r;
-  try {
-    r = await fetch(u, { headers: { "User-Agent": "movie-room-booth/1.0" } });
-  } catch {
-    return { ok: false, error: "Couldn't reach SubDL. Try again in a minute." };
-  }
-  let data;
-  try { data = await r.json(); } catch { return { ok: false, error: `SubDL answered with HTTP ${r.status}. Try again later.` }; }
-  if (!data || !data.status) {
-    const msg = String((data && data.error) || "SubDL returned an error");
-    if (/find|not found/i.test(msg)) return { ok: true, data: { results: [], subtitles: [] } };
-    return { ok: false, error: /key/i.test(msg) ? "SubDL rejected the API key. Check SUBDL_API_KEY." : msg };
-  }
-  return { ok: true, data };
-}
-
-// Reads a zip's file list. Returns null if the bytes aren't a zip (SubDL sometimes serves RAR).
-function readZip(buf) {
-  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-  if (buf.length < 22 || dv.getUint32(0, true) !== 0x04034b50) return null;
-  let eocd = -1;
-  for (let i = buf.length - 22; i >= Math.max(0, buf.length - 65557); i--) {
-    if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
-  }
-  if (eocd < 0) return null;
-  const count = dv.getUint16(eocd + 10, true);
-  let p = dv.getUint32(eocd + 16, true);
-  const latin = new TextDecoder("latin1"), utf8 = new TextDecoder();
-  const entries = [];
-  for (let k = 0; k < count && p + 46 <= buf.length; k++) {
-    if (dv.getUint32(p, true) !== 0x02014b50) break;
-    const flags = dv.getUint16(p + 8, true), nlen = dv.getUint16(p + 28, true);
-    const elen = dv.getUint16(p + 30, true), clen = dv.getUint16(p + 32, true);
-    const nameBytes = buf.subarray(p + 46, p + 46 + nlen);
-    const e = {
-      flags, method: dv.getUint16(p + 10, true), time: dv.getUint16(p + 12, true), date: dv.getUint16(p + 14, true),
-      crc: dv.getUint32(p + 16, true), csize: dv.getUint32(p + 20, true), usize: dv.getUint32(p + 24, true),
-      local: dv.getUint32(p + 42, true), name: (flags & 0x800 ? utf8 : latin).decode(nameBytes),
-    };
-    const lh = e.local;
-    if (lh + 30 <= buf.length && dv.getUint32(lh, true) === 0x04034b50) {
-      const start = lh + 30 + dv.getUint16(lh + 26, true) + dv.getUint16(lh + 28, true);
-      e.data = buf.subarray(start, start + e.csize);
-    }
-    entries.push(e);
-    p += 46 + nlen + elen + clen;
-  }
-  return entries;
-}
-
-// Picks the main subtitle file in a downloaded archive (largest .srt, else .vtt/.ass/.ssa).
-function pickSubtitle(entries) {
-  const ok = entries.filter((e) => e.data && e.data.length === e.csize && !(e.flags & 1)
-    && (e.method === 0 || e.method === 8) && !/forced/i.test(e.name) && !/__macosx/i.test(e.name));
-  for (const ext of SUB_EXT_ORDER) {
-    const hits = ok.filter((e) => e.name.toLowerCase().endsWith(ext));
-    if (hits.length) return { ...hits.sort((a, b) => b.usize - a.usize)[0], ext };
-  }
-  return null;
-}
-
-// Builds a zip from already-compressed entries (no recompression needed).
-function makeZip(files) {
-  const enc = new TextEncoder();
-  const parts = [], central = [];
-  let offset = 0;
-  for (const f of files) {
-    const name = enc.encode(f.name);
-    const lh = new DataView(new ArrayBuffer(30));
-    lh.setUint32(0, 0x04034b50, true); lh.setUint16(4, 20, true); lh.setUint16(6, 0x800, true);
-    lh.setUint16(8, f.method, true); lh.setUint16(10, f.time, true); lh.setUint16(12, f.date, true);
-    lh.setUint32(14, f.crc, true); lh.setUint32(18, f.csize, true); lh.setUint32(22, f.usize, true);
-    lh.setUint16(26, name.length, true); lh.setUint16(28, 0, true);
-    parts.push(new Uint8Array(lh.buffer), name, f.data);
-    const cd = new DataView(new ArrayBuffer(46));
-    cd.setUint32(0, 0x02014b50, true); cd.setUint16(4, 20, true); cd.setUint16(6, 20, true); cd.setUint16(8, 0x800, true);
-    cd.setUint16(10, f.method, true); cd.setUint16(12, f.time, true); cd.setUint16(14, f.date, true);
-    cd.setUint32(16, f.crc, true); cd.setUint32(20, f.csize, true); cd.setUint32(24, f.usize, true);
-    cd.setUint16(28, name.length, true); cd.setUint32(42, offset, true);
-    central.push(new Uint8Array(cd.buffer), name);
-    offset += 30 + name.length + f.data.length;
-  }
-  const cdSize = central.reduce((n, a) => n + a.length, 0);
-  const end = new DataView(new ArrayBuffer(22));
-  end.setUint32(0, 0x06054b50, true); end.setUint16(8, files.length, true); end.setUint16(10, files.length, true);
-  end.setUint32(12, cdSize, true); end.setUint32(16, offset, true);
-  const all = [...parts, ...central, new Uint8Array(end.buffer)];
-  const out = new Uint8Array(all.reduce((n, a) => n + a.length, 0));
-  let o = 0;
-  for (const a of all) { out.set(a, o); o += a.length; }
-  return out;
-}
-
-// Finds the best downloadable subtitle for one language. Plain before hearing-impaired.
-async function fetchLanguage(env, sdId, lang, baseName) {
-  const res = await subdl(env, { sd_id: sdId, type: "movie", languages: lang, subs_per_page: 10 });
-  if (!res.ok) return { lang, error: res.error };
-  const subs = (res.data.subtitles || []).filter((s) => s.url && !s.season);
-  if (!subs.length) return { lang, error: "none on SubDL" };
-  subs.sort((a, b) => (!!a.hi - !!b.hi) || (!!a.ai_translated - !!b.ai_translated));
-  for (const s of subs.slice(0, 2)) {
-    try {
-      const r = await fetch(new URL(s.url, SUBDL_DL), { headers: { "User-Agent": "movie-room-booth/1.0" } });
-      if (!r.ok) continue;
-      const entries = readZip(new Uint8Array(await r.arrayBuffer()));
-      const pick = entries && pickSubtitle(entries);
-      if (!pick) continue;
-      return { lang, release: s.release_name || s.name || "", hi: !!s.hi,
-        file: { ...pick, name: `${baseName}.${fileCode(lang)}${pick.ext}` } };
-    } catch { /* try the next one */ }
-  }
-  return { lang, error: "downloads weren't usable (not a zip, or no subtitle file inside)" };
-}
-
-async function subtitleRoutes(path, url, env) {
-  if (!env.ADMIN_KEY || url.searchParams.get("key") !== env.ADMIN_KEY) return json({ error: "wrong or missing key" }, 403);
-  if (!env.SUBDL_API_KEY) return json({ error: "The Worker has no SUBDL_API_KEY secret yet. Add it in the Worker's settings." }, 501);
-
-  if (path === "/subs/find") {
-    const q = (url.searchParams.get("q") || "").trim();
-    const year = (url.searchParams.get("year") || "").trim();
-    if (!q) return json({ error: "Type a movie title." }, 400);
-    const res = await subdl(env, { film_name: q, type: "movie", year: /^\d{4}$/.test(year) ? year : "", subs_per_page: 1 });
-    if (!res.ok) return json({ error: res.error }, 502);
-    const seen = new Set();
-    const results = (res.data.results || []).filter((m) => m.sd_id && !seen.has(m.sd_id) && seen.add(m.sd_id))
-      .map((m) => ({ sd_id: m.sd_id, name: m.name, year: m.year || (m.first_air_date || "").slice(0, 4) || null,
-        imdb_id: m.imdb_id || null, type: m.type || "movie" }));
-    return json({ results });
-  }
-
-  const sdId = url.searchParams.get("sd_id") || "";
-  if (!/^\d+$/.test(sdId)) return json({ error: "Pick a movie first." }, 400);
-
-  if (path === "/subs/langs") {
-    const [all, ...each] = await Promise.all([
-      subdl(env, { sd_id: sdId, type: "movie", subs_per_page: 30 }),
-      ...COMMON_LANGS.map((l) => subdl(env, { sd_id: sdId, type: "movie", languages: l, subs_per_page: 10 })),
-    ]);
-    const langs = new Map();
-    COMMON_LANGS.forEach((l, i) => {
-      const n = each[i].ok ? (each[i].data.subtitles || []).length : 0;
-      langs.set(l, { code: l, file: fileCode(l), count: n, more: n >= 10 });
-    });
-    if (all.ok) {
-      for (const s of all.data.subtitles || []) {
-        const l = String(s.language || "").toUpperCase();
-        if (!l || langs.has(l)) continue;
-        langs.set(l, { code: l, file: fileCode(l), count: 1, more: false, label: s.lang || l });
-      }
-    }
-    const failed = each.filter((r) => !r.ok).length;
-    return json({ languages: [...langs.values()], warning: failed ? `${failed} language checks failed; try again.` : null });
-  }
-
-  if (path === "/subs/pack") {
-    const langs = [...new Set((url.searchParams.get("langs") || "").toUpperCase().split(",").filter((l) => /^[A-Z]{2}(_[A-Z]{2})?$/.test(l)))];
-    const base = (url.searchParams.get("name") || "").trim();
-    if (!/^[A-Za-z0-9_-]{1,60}$/.test(base)) return json({ error: "File name can only use letters, numbers, - and _." }, 400);
-    if (!langs.length) return json({ error: "Tick at least one language." }, 400);
-    if (langs.length > MAX_PACK_LANGS) return json({ error: `Pick up to ${MAX_PACK_LANGS} languages per pack.` }, 400);
-
-    const got = await Promise.all(langs.map((l) => fetchLanguage(env, sdId, l, base)));
-    const included = got.filter((g) => g.file).map((g) => ({ lang: g.lang, file: g.file.name, release: g.release, hi: g.hi }));
-    const skipped = got.filter((g) => !g.file).map((g) => ({ lang: g.lang, reason: g.error }));
-    if (!included.length) return json({ error: "None of the picked languages could be downloaded.", skipped }, 404);
-    const zip = makeZip(got.filter((g) => g.file).map((g) => g.file));
-    const report = { included, skipped };
-
-    if (url.searchParams.get("save") === "1") {
-      if (!env.MOVIES) return json({ error: "Saving needs an R2 binding named MOVIES on the Worker. Use Download instead, or add the binding.", ...report }, 501);
-      const key = `subs/${base}.zip`;
-      await env.MOVIES.put(key, zip, { httpMetadata: { contentType: "application/zip" } });
-      return json({ saved: true, key, ...report });
-    }
-    return new Response(zip, { headers: {
-      ...CORS, "Content-Type": "application/zip", "Cache-Control": "no-store",
-      "Content-Disposition": `attachment; filename="${base}-subtitles.zip"`,
-      "X-Subs-Report": encodeURIComponent(JSON.stringify(report)),
-      "Access-Control-Expose-Headers": "X-Subs-Report",
-    } });
-  }
-  return json({ error: "unknown subtitle route" }, 404);
-}
-
-// ---------- Encoder control (GitHub Actions) ----------
-// Needs a secret named GITHUB_TOKEN (fine-grained, this repo only, Actions: read and write).
-// The R2 binding MOVIES (also used by the subtitle finder) lets the Booth list your files.
-
-const GITHUB_REPO = "K33Kz/hls-encoder";
-const WORKFLOWS = { encode: "encode-hls.yml", subs: "subtitles.yml" };
-const VIDEO_EXT = /\.(mp4|mkv|mov|m4v|webm|avi|ts)$/i;
-const SUBFILE_EXT = /\.(srt|vtt|ass|ssa|zip|mks)$/i;
-
-// What each workflow accepts, and how to check it.
-const INPUTS = {
-  encode: {
-    source_key: /^(?!https?:)[^\s][^\n]{0,299}$/, slug: /^[A-Za-z0-9_-]{1,60}$/, title: /^[^\n\r]{1,80}$/, mode: /^(fast|encode)$/,
-    height: /^(\d{3,4}|source)$/, segment_seconds: /^\d{1,2}$/, autoplay: "bool", overwrite: "bool",
-  },
-  subs: {
-    slug: /^[A-Za-z0-9_-]{1,60}$/, method: /^(file|all|embedded|generate)$/, source_key: /^(?!https?:)[^\s][^\n]{0,299}$/,
-    language: /^([a-z]{2,3}|auto)$/, offset_seconds: /^-?\d{1,4}(\.\d+)?$/, track: /^\d{1,2}$/, whisper_model: /^(small|medium|base)$/,
-  },
-};
-
-const repoOf = (env) => env.GITHUB_REPO || GITHUB_REPO;
-
-async function gh(env, path, method = "GET", body) {
-  let r;
-  try {
-    r = await fetch(`https://api.github.com/repos/${repoOf(env)}${path}`, {
-      method,
-      headers: {
-        Authorization: `Bearer ${env.GITHUB_TOKEN}`, Accept: "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "movie-room-booth",
-        ...(body ? { "Content-Type": "application/json" } : {}),
-      },
-      body: body ? JSON.stringify(body) : undefined,
-    });
-  } catch {
-    return { status: 0, error: "Couldn't reach GitHub. Try again in a minute." };
-  }
-  const data = r.status === 204 ? null : await r.json().catch(() => null);
-  if (r.ok) return { status: r.status, data };
-  const msg = (data && data.message) || `HTTP ${r.status}`;
-  const error =
-    r.status === 401 ? "GitHub rejected the token. It may have expired: make a new one and update GITHUB_TOKEN." :
-    r.status === 403 ? "The GitHub token isn't allowed to do that. It needs Actions: Read and write on this repo." :
-    r.status === 404 ? `GitHub couldn't find ${repoOf(env)} or that workflow. Check the repo name and that the token can access it.` :
-    `GitHub said: ${msg}`;
-  return { status: r.status, error, raw: msg };
-}
-
-function workflowOf(run) {
-  const p = run.path || "";
-  return p.endsWith(WORKFLOWS.encode) ? "encode" : p.endsWith(WORKFLOWS.subs) ? "subs" : null;
-}
-
-function runSummary(run) {
-  return {
-    id: run.id, workflow: workflowOf(run), title: run.display_title || run.name, status: run.status,
-    conclusion: run.conclusion, created: run.created_at, updated: run.updated_at, url: run.html_url,
-  };
-}
-
-async function listRuns(env) {
-  const res = await gh(env, "/actions/runs?per_page=15&event=workflow_dispatch");
-  if (res.error) return res;
-  return { runs: (res.data.workflow_runs || []).map(runSummary).filter((r) => r.workflow) };
-}
-
-async function encoderRoutes(path, url, env) {
-  if (!env.ADMIN_KEY || url.searchParams.get("key") !== env.ADMIN_KEY) return json({ error: "wrong or missing key" }, 403);
-
-  if (path === "/gh/files") {
-    const out = { repo: repoOf(env), hasToken: !!env.GITHUB_TOKEN, hasR2: !!env.MOVIES, videos: [], subtitles: [], slugs: [] };
-    if (!env.MOVIES) return json(out);
-    let cursor;
-    do {
-      const page = await env.MOVIES.list({ limit: 1000, cursor });
-      for (const o of page.objects) {
-        if (o.key.startsWith("hls/")) continue;
-        const f = { key: o.key, size: o.size, uploaded: o.uploaded };
-        if (VIDEO_EXT.test(o.key)) out.videos.push(f);
-        else if (SUBFILE_EXT.test(o.key)) out.subtitles.push(f);
-      }
-      cursor = page.truncated ? page.cursor : undefined;
-    } while (cursor && out.videos.length + out.subtitles.length < 3000);
-    const slugs = await env.MOVIES.list({ prefix: "hls/", delimiter: "/", limit: 1000 });
-    out.slugs = (slugs.delimitedPrefixes || []).map((p) => p.slice(4, -1)).filter((s) => !s.startsWith("_")).sort();
-    // Library: title, length and subtitle languages for each encoded movie.
-    const readJson = (k) => env.MOVIES.get(k).then((r) => (r ? r.json() : null)).catch(() => null);
-    out.library = await Promise.all(out.slugs.slice(0, 200).map(async (slug) => {
-      const [meta, subs, intro] = await Promise.all([
-        readJson(`hls/${slug}/meta.json`), readJson(`hls/${slug}/subs/index.json`),
-        env.MOVIES.head(`hls/${slug}/intro/index.m3u8`).catch(() => null),
-      ]);
-      return {
-        slug, title: (meta && meta.title) || slug, mode: (meta && meta.mode) || null,
-        duration: meta ? meta.duration || (meta.count ? meta.count * meta.segmentSeconds : null) : null,
-        complete: meta ? (meta.version >= 2 ? meta.complete === true : true) : null,
-        subtitles: subs && Array.isArray(subs.languages) ? subs.languages.map((l) => ({ code: l.code, name: l.name })) : [],
-        countdown: !!intro,
-      };
-    }));
-    const byNew = (a, b) => new Date(b.uploaded) - new Date(a.uploaded);
-    out.videos.sort(byNew); out.subtitles.sort(byNew);
-    return json(out);
-  }
-
-  if (!env.GITHUB_TOKEN) return json({ error: "The Worker has no GITHUB_TOKEN secret yet. Add it in the Worker's settings." }, 501);
-
-  if (path === "/gh/dispatch") {
-    const wf = url.searchParams.get("workflow");
-    const spec = INPUTS[wf];
-    if (!spec) return json({ error: "Unknown workflow." }, 400);
-    const inputs = {};
-    for (const [name, rule] of Object.entries(spec)) {
-      const v = url.searchParams.get(name);
-      if (v === null || v === "") continue;
-      if (rule === "bool") { inputs[name] = v === "true"; continue; }
-      if (!rule.test(v)) return json({ error: `"${name}" doesn't look right: ${v}` }, 400);
-      inputs[name] = v;
-    }
-    for (const req of wf === "encode" ? ["source_key", "slug"] : ["slug", "source_key"]) {
-      if (!inputs[req]) return json({ error: `Fill in ${req}.` }, 400);
-    }
-    const repo = await gh(env, "");
-    if (repo.error) return json({ error: repo.error }, 502);
-    const ref = repo.data.default_branch || "main";
-    const since = Date.now() - 5000;
-    const path2 = `/actions/workflows/${WORKFLOWS[wf]}/dispatches`;
-    let res = await gh(env, path2, "POST", { ref, inputs, return_run_details: true });
-    if (res.status === 422 && /return_run_details/i.test(res.raw || "")) res = await gh(env, path2, "POST", { ref, inputs });
-    if (res.error) return json({ error: res.error }, 502);
-    let runId = res.data && (res.data.workflow_run_id || res.data.id) || null;
-    if (!runId) {   // older API: find the run we just started
-      for (let i = 0; i < 4 && !runId; i++) {
-        await new Promise((r) => setTimeout(r, 1500));
-        const list = await gh(env, `/actions/workflows/${WORKFLOWS[wf]}/runs?per_page=5&event=workflow_dispatch`);
-        const hit = list.data && (list.data.workflow_runs || []).find((r) => new Date(r.created_at).getTime() >= since);
-        if (hit) runId = hit.id;
-      }
-    }
-    return json({ ok: true, runId, slug: inputs.slug, workflow: wf });
-  }
-
-  if (path === "/gh/runs") {
-    const res = await listRuns(env);
-    return res.error ? json({ error: res.error }, 502) : json(res);
-  }
-
-  if (path === "/gh/run") {
-    const id = url.searchParams.get("id") || "";
-    if (!/^\d+$/.test(id)) return json({ error: "Bad run id." }, 400);
-    const [run, jobs] = await Promise.all([gh(env, `/actions/runs/${id}`), gh(env, `/actions/runs/${id}/jobs`)]);
-    if (run.error) return json({ error: run.error }, 502);
-    const job = jobs.data && (jobs.data.jobs || [])[0];
-    const steps = job ? (job.steps || []).filter((s) => !/^(Set up job|Complete job|Post )/.test(s.name))
-      .map((s) => ({ name: s.name, status: s.status, conclusion: s.conclusion })) : [];
-    let notices = [];
-    if (job && job.check_run_url) {
-      const ann = await gh(env, `/check-runs/${job.id}/annotations`);
-      notices = (ann.data || []).map((a) => ({ level: a.annotation_level, message: a.message }))
-        .filter((a) => !/^Process completed with exit code/.test(a.message));
-    }
-    let progress = null;
-    const slug = url.searchParams.get("slug") || "";
-    if (workflowOf(run.data) === "encode" && /^[A-Za-z0-9_-]+$/.test(slug)) {
-      movieCache.delete(slug);
-      const m = await loadMovie(slug).catch(() => null);
-      if (m) progress = { slug, uploaded: m.uploaded, duration: m.duration, complete: m.complete };
-    }
-    return json({ run: runSummary(run.data), steps, notices, progress });
-  }
-
-  return json({ error: "unknown encoder route" }, 404);
-}
-
-
-// ---------- Routes ----------
-
-async function showingRoutes(path, url, env) {
-  if (!env.ADMIN_KEY || url.searchParams.get("key") !== env.ADMIN_KEY) return text("wrong or missing key", 403);
-  const now = Date.now() / 1000;
-
-  if (path === "/stop") {
-    const cont = await continuation(env, now);
-    await setState(env, { v: 3, stopped: true, seqBase: cont.seqBase, discBase: cont.discBase, ver: cont.ver });
-    return text("Stopped. Nothing is playing now.");
-  }
-
-  if (path === "/seek") {
-    const st = await getState(env, true);
-    if (!isActive(st)) return text("Nothing is playing, so there's nothing to jump in.", 409);
-    movieCache.delete(st.movie);
-    const data = await loadMovie(st.movie);
-    if (!data || !data.segs.length) return text(`movie "${st.movie}" not found in R2`, 404);
-    const toRaw = url.searchParams.get("to"), byRaw = url.searchParams.get("by");
-    const pos = Math.max(0, now - st.start - HOLD_TARGETS * data.targetDuration); // where players are
-    let target = toRaw !== null && toRaw !== "" ? Number(toRaw) : pos + Number(byRaw);
-    if (!Number.isFinite(target)) return text("add ?to=<seconds> or ?by=<seconds>", 400);
-    const lastStart = data.segs[data.segs.length - 1].start;
-    const limit = data.complete ? lastStart : Math.max(0, data.uploaded - 3 * data.targetDuration);
-    target = Math.min(Math.max(0, target), limit);
-    const k = segmentAt(data.segs, target);
-    const lead = leadFrom(data.segs, k, HOLD_TARGETS * data.targetDuration); // pre-aired so players restart at once
-    const cont = await continuation(env, now);
-    await setState(env, { ...st, start: now - (data.segs[k].start + lead), k0: k, intro: null, at: null,
-      seqBase: cont.seqBase, discBase: cont.discBase, ver: cont.ver });
-    return text(`Jumped to ${formatTime(data.segs[k].start)} in "${data.title}".`);
-  }
-
-  // /play
-  const movie = url.searchParams.get("movie") || "";
-  if (!/^[A-Za-z0-9_-]+$/.test(movie) || movie.startsWith("_")) return text("add ?movie=<slug> to the link", 400);
-  movieCache.delete(movie);
-  const data = await loadMovie(movie);
-  if (!data) return text(`movie "${movie}" not found in R2 (or still starting up)`, 404);
-  if (data.segs.length < MIN_SEGMENTS_TO_PLAY) {
-    return text(`"${movie}" is still preparing (${data.segs.length} segments ready). Try again in a minute.`, 409);
-  }
-  const countdown = Math.min(MAX_COUNTDOWN, Math.max(0, parseInt(url.searchParams.get("countdown") || "0", 10) || 0));
-  const atRaw = url.searchParams.get("at");
-  let at = null;
-  if (atRaw) {
-    at = Math.floor(Number(atRaw));
-    if (!Number.isFinite(at) || at < now + 15) return text("Pick a start time at least a minute from now.", 400);
-    if (at > now + MAX_SCHEDULE_DAYS * 86400) return text(`Schedule up to ${MAX_SCHEDULE_DAYS} days ahead.`, 400);
-  }
-  const intro = at || countdown ? await findIntro(movie) : null;
-  // Players need HOLD_TARGETS target durations already in the playlist before they start, so every
-  // start is back-dated by that much: the movie (or countdown) begins playing the moment players open it.
-  const need = HOLD_TARGETS * targetOf(data, intro);
-  const movieLead = leadFrom(data.segs, 0, need);
-  let movieBegin, introFrom = null, note = "", shown = countdown;
-  if (at) {
-    if (intro) { movieBegin = at; introFrom = Math.max(0, intro.L - MAX_COUNTDOWN); }
-    else { movieBegin = at - movieLead; note = " (no countdown clip found, so it will start without one)"; }
-  } else if (countdown && intro) {
-    const d = intro.segs[0].dur;
-    const lead = Math.min(Math.ceil(need / d) * d, intro.L - d);
-    shown = Math.max(d, Math.min(countdown, intro.L - lead));
-    introFrom = Math.max(0, Math.floor((intro.L - shown - lead) / d) * d);
-    movieBegin = now + shown;
-    if (shown < countdown) note = ` (shortened to ${shown} s so players can load it)`;
-  } else {
-    movieBegin = now - movieLead;
-    if (countdown) note = " (no countdown clip found, so it started right away)";
-  }
-  const cont = await continuation(env, now);
-  await setState(env, {
-    v: 3, movie, title: data.title, start: movieBegin - data.segs[0].start, k0: 0,
-    intro: intro && introFrom !== null ? { src: intro.src, from: introFrom } : null,
-    seqBase: cont.seqBase, discBase: cont.discBase, ver: cont.ver, at,
-  });
-  const enc = data.complete ? "" : ` (still encoding: ${formatTime(data.uploaded)} of ${formatTime(data.duration)} ready)`;
-  if (at) return text(`Scheduled "${data.title}" for ${new Date(at * 1000).toISOString()}${note}.${enc}`);
-  if (countdown && intro) return text(`Starting "${data.title}" in ${formatTime(movieBegin - now)} after a countdown${note}.${enc}`);
-  return text(`Now playing "${data.title}" from the beginning${note}${enc}. Viewers use /live.`);
-}
-
-export default {
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-    const path = url.pathname.replace(/\/+$/, "") || "/";
-    const waitUntil = ctx && ctx.waitUntil ? (p) => ctx.waitUntil(p.catch(() => {})) : null;
-
-    if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: { ...CORS, "Access-Control-Max-Age": "86400" } });
-    if (path.startsWith("/subs/")) return subtitleRoutes(path, url, env);
-    if (path.startsWith("/gh/")) return encoderRoutes(path, url, env);
-    if (path.startsWith("/up/")) return uploadRoutes(path, request, url, env);
-    if (path === "/play" || path === "/stop" || path === "/seek") return showingRoutes(path, url, env);
-
-    const now = Date.now() / 1000;
-    const st = await getState(env);
-    const active = isActive(st);
-    const data = active ? await loadMovie(st.movie) : null;
-    const intro = active && st.intro ? await loadIntro(st.intro.src) : null;
-    const tl = data ? timeline(st, data, intro, now) : null;
-    const phase = phaseOf(st, data, tl, now);
-
-    if (path === "/live" || path === "/dvr") {
-      if (waitUntil) waitUntil(noteViewer(request, env));
-      if (!active) return text("nothing is playing", 404);
-      if (!data) return text("movie not found", 404);
-      return buildPlaylist(st, data, intro, now, path === "/dvr");
-    }
-
-    if (path === "/status") {
-      const viewers = await countViewers(env, waitUntil);
-      const tail = viewers ? ` · about ${viewers} watching` : "";
-      if (phase === "idle") return text("Nothing is playing." + tail);
-      if (phase === "missing") return text(`Playing "${st.movie}" but its files are missing from R2.`);
-      if (phase === "scheduled") return text(`Scheduled: "${data.title}" starts in ${formatTime(tl.movieBegin - now)}.` + tail);
-      if (phase === "countdown") return text(`Countdown: "${data.title}" starts in ${formatTime(tl.movieBegin - now)}.` + tail);
-      if (phase === "ended") return text(`"${data.title}" has finished.` + tail);
-      const elapsed = now - st.start;
-      let line = `Playing "${data.title}": ${formatTime(elapsed)} of ${formatTime(data.duration)}`;
-      if (!data.complete) {
-        const lead = data.uploaded - elapsed;
-        line += lead > 0
-          ? ` (still encoding, ${formatTime(lead)} ahead of viewers)`
-          : ` (WARNING: viewers have caught up to the encoder and may buffer)`;
-      }
-      return text(line + tail);
-    }
-
-    if (path === "/now") {
-      const viewers = await countViewers(env, waitUntil);
-      if (!data || phase === "idle" || phase === "ended" || phase === "missing") {
-        return json({ phase: phase === "missing" ? "idle" : phase, playing: false, version: st ? st.ver : 0,
-          serverTime: now, viewers, ...(data ? { movie: st.movie, title: data.title } : {}) });
-      }
-      const target = Math.ceil(Math.max(data.targetDuration, ...tl.introSegs.map((s) => s.dur), 1));
-      return json({
-        phase,                                         // scheduled | countdown | playing
-        playing: phase === "playing" || phase === "countdown",
-        movie: st.movie,
-        title: data.title,
-        version: st.ver,                               // changes on every start, jump and stop
-        start: st.start,                               // unix time of movie time 0
-        serverTime: now,
-        position: now - st.start,                      // seconds into the movie at the live edge (negative before it starts)
-        watching: Math.max(0, now - st.start - HOLD_TARGETS * target), // roughly what players are seeing right now
-        startsIn: Math.max(0, tl.movieBegin - now),
-        scheduledAt: st.at || null,
-        duration: data.duration,
-        complete: data.complete,
-        captionDelay: 3 * target,                      // players usually sit about this far behind the live edge
-        subtitles: `${data.base}/subs/index.json`,
-        viewers,
-      });
-    }
-
-    return text("Links: /live, /dvr, /status, /now, /play?movie=<slug>&key=<key>, /seek?to=<seconds>&key=<key>, /stop?key=<key>", 404);
-  },
-};
+# .github/workflows/encode-hls.yml
+#
+# Encodes a movie from R2 into HLS segments and uploads them WHILE it works,
+# so a showing can start a minute or two after you press Run.
+#
+#   mode = fast    Re-packages your H.264/AAC file without re-encoding.
+#                  Whole movie in a few minutes, same quality as the original.
+#                  Segment lengths follow the file's own keyframes (often 2-10 s).
+#   mode = encode  Full re-encode at the chosen height with exact 4 s segments.
+#                  Slower (about 2-4x real time on a public repo), smaller files,
+#                  tighter sync. Upload runs alongside, so you can still start early.
+#
+# Required repo secrets: R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET
+# Optional (for autoplay): WORKER_URL (e.g. https://movie-live.you.workers.dev), WORKER_ADMIN_KEY
+
+name: Encode movie to HLS
+run-name: "Encode ${{ inputs.slug }} (${{ inputs.mode }})"
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_key:
+        description: "File name inside your R2 bucket (e.g. mymovie.mp4) - NOT the full web address"
+        required: true
+      slug:
+        description: "Short name for this movie, letters/numbers/-/_ only (e.g. mymovie)"
+        required: true
+      title:
+        description: "Optional: the movie's name as players should see it on the countdown (e.g. Sintel). Defaults to the slug"
+        default: ""
+      mode:
+        description: "fast = no re-encode (minutes). encode = full re-encode (slower, exact segments)"
+        type: choice
+        options: [fast, encode]
+        default: fast
+      height:
+        description: "encode mode only: 720, 1080, or source"
+        default: "720"
+      segment_seconds:
+        description: "Target segment length in seconds"
+        default: "4"
+      autoplay:
+        description: "Start the showing automatically as soon as it's safe (needs WORKER_URL and WORKER_ADMIN_KEY secrets)"
+        type: boolean
+        default: false
+      overwrite:
+        description: "Replace a movie that already uses this slug"
+        type: boolean
+        default: false
+
+jobs:
+  encode:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+      R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+      BUCKET: ${{ secrets.R2_BUCKET }}
+      WORKER_URL: ${{ secrets.WORKER_URL }}
+      WORKER_ADMIN_KEY: ${{ secrets.WORKER_ADMIN_KEY }}
+      SOURCE_KEY: ${{ inputs.source_key }}
+      SLUG: ${{ inputs.slug }}
+      TITLE: ${{ inputs.title }}
+      MODE: ${{ inputs.mode }}
+      HEIGHT: ${{ inputs.height }}
+      SEG: ${{ inputs.segment_seconds }}
+      AUTOPLAY: ${{ inputs.autoplay }}
+      OVERWRITE: ${{ inputs.overwrite }}
+
+    steps:
+      - name: Check inputs
+        run: |
+          [[ "$SLUG" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "::error::Slug can only use letters, numbers, - and _"; exit 1; }
+          [[ "$SEG" =~ ^[0-9]+$ && "$SEG" -ge 1 ]] || { echo "::error::segment_seconds must be a whole number"; exit 1; }
+          [[ "$HEIGHT" =~ ^([0-9]+|source)$ ]] || { echo "::error::height must be a number or 'source'"; exit 1; }
+          if [[ "$SOURCE_KEY" == http* ]]; then
+            echo "::error::source_key should be just the file name inside the bucket (e.g. mymovie.mp4), not a web address"; exit 1
+          fi
+          if [[ "$AUTOPLAY" == "true" && ( -z "$WORKER_URL" || -z "$WORKER_ADMIN_KEY" ) ]]; then
+            echo "::error::autoplay needs the WORKER_URL and WORKER_ADMIN_KEY repo secrets"; exit 1
+          fi
+
+      - name: Check the slug is free
+        run: |
+          if aws s3 ls "s3://$BUCKET/hls/$SLUG/index.m3u8" --endpoint-url "$R2_ENDPOINT" >/dev/null 2>&1; then
+            if [[ "$OVERWRITE" == "true" ]]; then
+              echo "Removing the old hls/$SLUG/ ..."
+              aws s3 rm "s3://$BUCKET/hls/$SLUG/" --recursive --only-show-errors --endpoint-url "$R2_ENDPOINT"
+            else
+              echo "::error::hls/$SLUG/ already exists. Pick a new slug, or tick 'overwrite' to replace it."; exit 1
+            fi
+          fi
+
+      - name: Install ffmpeg
+        run: |
+          if ! command -v ffmpeg >/dev/null || [ ! -f /usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf ]; then
+            sudo apt-get update -q && sudo apt-get install -y -q ffmpeg fonts-dejavu-core
+          fi
+
+      - name: Download source from R2
+        run: |
+          EXT="${SOURCE_KEY##*.}"; [[ "$EXT" == "$SOURCE_KEY" ]] && EXT=mp4
+          aws s3 cp "s3://$BUCKET/$SOURCE_KEY" "source.$EXT" --only-show-errors --endpoint-url "$R2_ENDPOINT"
+          echo "SRC=source.$EXT" >> "$GITHUB_ENV"
+          ls -lh "source.$EXT"
+
+      - name: Make the countdown intro
+        run: |
+          set -euo pipefail
+          # A 60 s "Now showing <title>" countdown, played before the movie when a showing has a countdown.
+          make_intro() {  # $1 = title, $2 = R2 folder
+            local W; W=$(mktemp -d); mkdir -p "$W/out"
+            local FB=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf F=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
+            printf '%s' "$1" > "$W/title.txt"
+            local SIZE=68; (( ${#1} > 24 )) && SIZE=50; (( ${#1} > 36 )) && SIZE=36
+            printf '%s\n' \
+              "[0:v]vignette=angle=PI/3.2," \
+              "drawtext=fontfile=$F:text='1 S O U N D   S T U D I O S   P R E S E N T S':fontsize=22:fontcolor=0x9C86FF:x=(w-text_w)/2:y=h*0.27," \
+              "drawtext=fontfile=$FB:textfile=$W/title.txt:expansion=none:fontsize=$SIZE:fontcolor=0xF2ECFD:x=(w-text_w)/2:y=h*0.27+52," \
+              "drawtext=fontfile=$F:text='Starting in':fontsize=24:fontcolor=0x9A96B8:x=(w-text_w)/2:y=h*0.60," \
+              "drawtext=fontfile=$FB:text='%{eif\\:max(0\\,ceil(60-t))\\:d}':fontsize=96:fontcolor=0xF2ECFD:x=(w-text_w)/2:y=h*0.60+36[bg];" \
+              "[bg][1:v]overlay=x='-w+W*t/60':y=H-h:shortest=1[v]" > "$W/graph.txt"
+            ffmpeg -hide_banner -loglevel error -y \
+              -f lavfi -i "color=c=0x0E0B1C:s=1280x720:r=25:d=60" -f lavfi -i "color=c=0x6A4BFF:s=1280x8:r=25:d=60" \
+              -f lavfi -i "anullsrc=r=48000:cl=stereo" -filter_complex_script "$W/graph.txt" -map "[v]" -map 2:a -t 60 \
+              -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -force_key_frames "expr:gte(t,n_forced*2)" -sc_threshold 0 \
+              -c:a aac -b:a 96k -ac 2 -ar 48000 -f hls -hls_time 2 -hls_playlist_type vod -hls_flags independent_segments \
+              -hls_segment_filename "$W/out/seg_%05d.ts" "$W/out/index.m3u8"
+            aws s3 cp "$W/out/" "s3://$BUCKET/$2" --recursive --exclude "*" --include "*.ts" --content-type video/mp2t \
+              --cache-control "public, max-age=3600" --only-show-errors --endpoint-url "$R2_ENDPOINT"
+            aws s3 cp "$W/out/index.m3u8" "s3://$BUCKET/$2index.m3u8" --content-type application/vnd.apple.mpegurl \
+              --cache-control no-cache --only-show-errors --endpoint-url "$R2_ENDPOINT"
+            rm -rf "$W"
+          }
+          SHOWN="${TITLE:-$(echo "$SLUG" | tr '_-' '  ')}"
+          make_intro "$SHOWN" "hls/$SLUG/intro/"
+          echo "Countdown intro ready for \"$SHOWN\""
+          if ! aws s3 ls "s3://$BUCKET/hls/_intro/index.m3u8" --endpoint-url "$R2_ENDPOINT" >/dev/null 2>&1; then
+            make_intro "Feature Presentation" "hls/_intro/"
+            echo "Shared countdown intro created (used by older movies)"
+          fi
+
+      - name: Encode and upload as it goes
+        run: |
+          set -uo pipefail
+          DEST="s3://$BUCKET/hls/$SLUG/"
+          mkdir -p out
+
+          probe() { ffprobe -v error -select_streams "$1" -show_entries "stream=$2" -of csv=p=0 "$SRC" | head -1; }
+          DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$SRC")
+          VCODEC=$(probe v:0 codec_name); PIXFMT=$(probe v:0 pix_fmt); ACODEC=$(probe a:0 codec_name || true)
+          echo "Source: video=$VCODEC ($PIXFMT) audio=${ACODEC:-none} length=${DUR}s"
+
+          if [[ "$MODE" == "fast" ]]; then
+            if [[ "$VCODEC" != "h264" || "$PIXFMT" == *10* ]]; then
+              echo "::error::Fast mode needs 8-bit H.264 video, but this file is $VCODEC ($PIXFMT). Run again with mode = encode."; exit 1
+            fi
+            VIDEO=(-c:v copy)
+            if [[ "$ACODEC" == "aac" ]]; then AUDIO=(-c:a copy); else AUDIO=(-c:a aac -b:a 160k -ac 2 -ar 48000); fi
+          else
+            if [[ "$HEIGHT" == "source" ]]; then VF=(); else VF=(-vf "scale=-2:$HEIGHT"); fi
+            VIDEO=("${VF[@]}" -c:v libx264 -preset veryfast -crf 21 -profile:v high -pix_fmt yuv420p
+                   -force_key_frames "expr:gte(t,n_forced*$SEG)" -sc_threshold 0)
+            AUDIO=(-c:a aac -b:a 128k -ac 2 -ar 48000)
+          fi
+
+          write_meta() {  # $1 = complete (true/false), $2 = duration
+            python3 -c 'import json,os,sys; print(json.dumps({"version": 2, "mode": os.environ["MODE"], "targetSeconds": int(os.environ["SEG"]),
+              "duration": float(sys.argv[2]), "complete": sys.argv[1] == "true", "title": os.environ.get("TITLE") or os.environ["SLUG"]}))' \
+              "$1" "$2" > out/meta.json
+            aws s3 cp out/meta.json "${DEST}meta.json" --content-type application/json \
+              --cache-control no-cache --only-show-errors --endpoint-url "$R2_ENDPOINT"
+          }
+
+          # Sum of segment lengths in a playlist = how much of the movie is ready.
+          ready_seconds() { awk -F'[:,]' '/^#EXTINF/ {s+=$2} END {printf "%.0f", s+0}' "$1"; }
+          fmt() { printf '%d:%02d:%02d' $(($1/3600)) $(($1%3600/60)) $(($1%60)); }
+
+          # Copy the playlist first, then every finished segment, then the playlist.
+          # So viewers never get a playlist pointing at a segment that isn't uploaded yet.
+          sync_up() {
+            [[ -f out/index.m3u8 ]] || return 1
+            cp out/index.m3u8 out/snapshot.m3u8
+            aws s3 sync out/ "$DEST" --exclude "*" --include "seg_*.ts" --content-type video/mp2t \
+              --cache-control "public, max-age=600" --only-show-errors --endpoint-url "$R2_ENDPOINT" || return 1
+            aws s3 cp out/snapshot.m3u8 "${DEST}index.m3u8" --content-type application/vnd.apple.mpegurl \
+              --cache-control no-cache --only-show-errors --endpoint-url "$R2_ENDPOINT" || return 1
+          }
+
+          ffmpeg -hide_banner -nostdin -loglevel warning -stats -stats_period 15 -y -i "$SRC" \
+            -map 0:v:0 -map "0:a:0?" "${VIDEO[@]}" "${AUDIO[@]}" \
+            -f hls -hls_time "$SEG" -hls_playlist_type event \
+            -hls_flags independent_segments+temp_file \
+            -hls_segment_filename "out/seg_%05d.ts" out/index.m3u8 &
+          FF=$!
+
+          START=$(date +%s); META_SENT=0; READY=0; WARNED=0
+          TOTAL=${DUR%.*}
+          while kill -0 "$FF" 2>/dev/null; do
+            for _ in $(seq 15); do kill -0 "$FF" 2>/dev/null || break; sleep 1; done
+            kill -0 "$FF" 2>/dev/null || break
+            sync_up || { echo "(upload will retry)"; continue; }
+            [[ $META_SENT == 1 ]] || { write_meta false "$DUR" && META_SENT=1; }
+
+            DONE=$(ready_seconds out/snapshot.m3u8); WALL=$(( $(date +%s) - START ))
+            SPEED=$(awk -v d="$DONE" -v w="$WALL" 'BEGIN {printf "%.1f", (w>0 ? d/w : 0)}')
+            echo ">> Uploaded $(fmt "$DONE") of $(fmt "$TOTAL")  (${SPEED}x real time)"
+
+            if (( WALL >= 60 )) && awk -v s="$SPEED" 'BEGIN {exit !(s < 1.2)}' && (( WARNED == 0 )); then
+              echo "::warning::Encoding at only ${SPEED}x real time. Viewers may catch up to it and buffer. Wait for it to finish before starting, or use fast mode."
+              WARNED=1
+            fi
+            # Safe to start: 1 minute ready, and running clearly faster than playback.
+            if (( READY == 0 && DONE >= 60 && WALL >= 30 )) && awk -v s="$SPEED" 'BEGIN {exit !(s >= 1.2)}'; then
+              READY=1
+              echo "::notice::READY - safe to start the showing now (movie=$SLUG)"
+              if [[ "$AUTOPLAY" == "true" ]]; then
+                curl -fsS "$WORKER_URL/play?movie=$SLUG&countdown=30&key=$WORKER_ADMIN_KEY" && echo "::notice::Autoplay started the showing" \
+                  || echo "::warning::Autoplay request failed. Start it with your /play link."
+              fi
+            fi
+          done
+
+          wait "$FF"; CODE=$?
+          if (( CODE != 0 )); then echo "::error::ffmpeg failed (exit $CODE). See the log above."; exit "$CODE"; fi
+
+          # Final upload with the finished playlist, then mark the movie complete.
+          OK=0; for i in 1 2 3; do if sync_up; then OK=1; break; fi; sleep 5; done
+          (( OK == 1 )) || { echo "::error::Final upload failed"; exit 1; }
+          FINAL=$(awk -F'[:,]' '/^#EXTINF/ {s+=$2} END {printf "%.3f", s}' out/index.m3u8)
+          write_meta true "$FINAL"
+          COUNT=$(ls out/seg_*.ts | wc -l)
+          MAXSEG=$(awk -F'[:,]' '/^#EXTINF/ {if ($2>m) m=$2} END {printf "%.1f", m}' out/index.m3u8)
+          echo "Done: $COUNT segments (longest ${MAXSEG}s) uploaded to hls/$SLUG/ in $(( $(date +%s) - START ))s"
+          if awk -v m="$MAXSEG" 'BEGIN {exit !(m > 6.5)}'; then
+            echo "::warning::Some segments are ${MAXSEG}s long (fast mode follows the file's own keyframes). Players download more before they start. For quicker starts, re-encode with mode = encode."
+          fi
+          if (( READY == 0 )); then
+            echo "::notice::READY - finished, safe to start the showing (movie=$SLUG)"
+            if [[ "$AUTOPLAY" == "true" ]]; then curl -fsS "$WORKER_URL/play?movie=$SLUG&countdown=30&key=$WORKER_ADMIN_KEY" || true; fi
+          fi
