@@ -25,6 +25,9 @@ on:
       slug:
         description: "Short name for this movie, letters/numbers/-/_ only (e.g. mymovie)"
         required: true
+      title:
+        description: "Optional: the movie's name as players should see it on the countdown (e.g. Sintel). Defaults to the slug"
+        default: ""
       mode:
         description: "fast = no re-encode (minutes). encode = full re-encode (slower, exact segments)"
         type: choice
@@ -61,6 +64,7 @@ jobs:
       WORKER_ADMIN_KEY: ${{ secrets.WORKER_ADMIN_KEY }}
       SOURCE_KEY: ${{ inputs.source_key }}
       SLUG: ${{ inputs.slug }}
+      TITLE: ${{ inputs.title }}
       MODE: ${{ inputs.mode }}
       HEIGHT: ${{ inputs.height }}
       SEG: ${{ inputs.segment_seconds }}
@@ -92,7 +96,10 @@ jobs:
           fi
 
       - name: Install ffmpeg
-        run: command -v ffmpeg >/dev/null || (sudo apt-get update -q && sudo apt-get install -y -q ffmpeg)
+        run: |
+          if ! command -v ffmpeg >/dev/null || [ ! -f /usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf ]; then
+            sudo apt-get update -q && sudo apt-get install -y -q ffmpeg fonts-dejavu-core
+          fi
 
       - name: Download source from R2
         run: |
@@ -100,6 +107,42 @@ jobs:
           aws s3 cp "s3://$BUCKET/$SOURCE_KEY" "source.$EXT" --only-show-errors --endpoint-url "$R2_ENDPOINT"
           echo "SRC=source.$EXT" >> "$GITHUB_ENV"
           ls -lh "source.$EXT"
+
+      - name: Make the countdown intro
+        run: |
+          set -euo pipefail
+          # A 60 s "Now showing <title>" countdown, played before the movie when a showing has a countdown.
+          make_intro() {  # $1 = title, $2 = R2 folder
+            local W; W=$(mktemp -d); mkdir -p "$W/out"
+            local FB=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf F=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
+            printf '%s' "$1" > "$W/title.txt"
+            local SIZE=68; (( ${#1} > 24 )) && SIZE=50; (( ${#1} > 36 )) && SIZE=36
+            printf '%s\n' \
+              "[0:v]vignette=angle=PI/3.2," \
+              "drawtext=fontfile=$F:text='1 S O U N D   S T U D I O S   P R E S E N T S':fontsize=22:fontcolor=0x9C86FF:x=(w-text_w)/2:y=h*0.27," \
+              "drawtext=fontfile=$FB:textfile=$W/title.txt:expansion=none:fontsize=$SIZE:fontcolor=0xF2ECFD:x=(w-text_w)/2:y=h*0.27+52," \
+              "drawtext=fontfile=$F:text='Starting in':fontsize=24:fontcolor=0x9A96B8:x=(w-text_w)/2:y=h*0.60," \
+              "drawtext=fontfile=$FB:text='%{eif\\:max(0\\,ceil(60-t))\\:d}':fontsize=96:fontcolor=0xF2ECFD:x=(w-text_w)/2:y=h*0.60+36[bg];" \
+              "[bg][1:v]overlay=x='-w+W*t/60':y=H-h:shortest=1[v]" > "$W/graph.txt"
+            ffmpeg -hide_banner -loglevel error -y \
+              -f lavfi -i "color=c=0x0E0B1C:s=1280x720:r=25:d=60" -f lavfi -i "color=c=0x6A4BFF:s=1280x8:r=25:d=60" \
+              -f lavfi -i "anullsrc=r=48000:cl=stereo" -filter_complex_script "$W/graph.txt" -map "[v]" -map 2:a -t 60 \
+              -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -force_key_frames "expr:gte(t,n_forced*2)" -sc_threshold 0 \
+              -c:a aac -b:a 96k -ac 2 -ar 48000 -f hls -hls_time 2 -hls_playlist_type vod -hls_flags independent_segments \
+              -hls_segment_filename "$W/out/seg_%05d.ts" "$W/out/index.m3u8"
+            aws s3 cp "$W/out/" "s3://$BUCKET/$2" --recursive --exclude "*" --include "*.ts" --content-type video/mp2t \
+              --cache-control "public, max-age=3600" --only-show-errors --endpoint-url "$R2_ENDPOINT"
+            aws s3 cp "$W/out/index.m3u8" "s3://$BUCKET/$2index.m3u8" --content-type application/vnd.apple.mpegurl \
+              --cache-control no-cache --only-show-errors --endpoint-url "$R2_ENDPOINT"
+            rm -rf "$W"
+          }
+          SHOWN="${TITLE:-$(echo "$SLUG" | tr '_-' '  ')}"
+          make_intro "$SHOWN" "hls/$SLUG/intro/"
+          echo "Countdown intro ready for \"$SHOWN\""
+          if ! aws s3 ls "s3://$BUCKET/hls/_intro/index.m3u8" --endpoint-url "$R2_ENDPOINT" >/dev/null 2>&1; then
+            make_intro "Feature Presentation" "hls/_intro/"
+            echo "Shared countdown intro created (used by older movies)"
+          fi
 
       - name: Encode and upload as it goes
         run: |
@@ -126,8 +169,9 @@ jobs:
           fi
 
           write_meta() {  # $1 = complete (true/false), $2 = duration
-            printf '{"version": 2, "mode": "%s", "targetSeconds": %s, "duration": %s, "complete": %s}\n' \
-              "$MODE" "$SEG" "$2" "$1" > out/meta.json
+            python3 -c 'import json,os,sys; print(json.dumps({"version": 2, "mode": os.environ["MODE"], "targetSeconds": int(os.environ["SEG"]),
+              "duration": float(sys.argv[2]), "complete": sys.argv[1] == "true", "title": os.environ.get("TITLE") or os.environ["SLUG"]}))' \
+              "$1" "$2" > out/meta.json
             aws s3 cp out/meta.json "${DEST}meta.json" --content-type application/json \
               --cache-control no-cache --only-show-errors --endpoint-url "$R2_ENDPOINT"
           }
@@ -175,7 +219,7 @@ jobs:
               READY=1
               echo "::notice::READY - safe to start the showing now (movie=$SLUG)"
               if [[ "$AUTOPLAY" == "true" ]]; then
-                curl -fsS "$WORKER_URL/play?movie=$SLUG&key=$WORKER_ADMIN_KEY" && echo "::notice::Autoplay started the showing" \
+                curl -fsS "$WORKER_URL/play?movie=$SLUG&countdown=30&key=$WORKER_ADMIN_KEY" && echo "::notice::Autoplay started the showing" \
                   || echo "::warning::Autoplay request failed. Start it with your /play link."
               fi
             fi
@@ -194,5 +238,5 @@ jobs:
           echo "Done: $COUNT segments (longest ${MAXSEG}s) uploaded to hls/$SLUG/ in $(( $(date +%s) - START ))s"
           if (( READY == 0 )); then
             echo "::notice::READY - finished, safe to start the showing (movie=$SLUG)"
-            if [[ "$AUTOPLAY" == "true" ]]; then curl -fsS "$WORKER_URL/play?movie=$SLUG&key=$WORKER_ADMIN_KEY" || true; fi
+            if [[ "$AUTOPLAY" == "true" ]]; then curl -fsS "$WORKER_URL/play?movie=$SLUG&countdown=30&key=$WORKER_ADMIN_KEY" || true; fi
           fi
