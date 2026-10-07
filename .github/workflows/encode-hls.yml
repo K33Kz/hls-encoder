@@ -12,10 +12,10 @@
 #
 # Required repo secrets: R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET
 # Optional (for autoplay): WORKER_URL (e.g. https://movie-live.you.workers.dev), WORKER_ADMIN_KEY
-
+ 
 name: Encode movie to HLS
 run-name: "Encode ${{ inputs.slug }} (${{ inputs.mode }})"
-
+ 
 on:
   workflow_dispatch:
     inputs:
@@ -47,7 +47,7 @@ on:
         description: "Replace a movie that already uses this slug"
         type: boolean
         default: false
-
+ 
 jobs:
   encode:
     runs-on: ubuntu-latest
@@ -70,7 +70,7 @@ jobs:
       SEG: ${{ inputs.segment_seconds }}
       AUTOPLAY: ${{ inputs.autoplay }}
       OVERWRITE: ${{ inputs.overwrite }}
-
+ 
     steps:
       - name: Check inputs
         run: |
@@ -83,7 +83,7 @@ jobs:
           if [[ "$AUTOPLAY" == "true" && ( -z "$WORKER_URL" || -z "$WORKER_ADMIN_KEY" ) ]]; then
             echo "::error::autoplay needs the WORKER_URL and WORKER_ADMIN_KEY repo secrets"; exit 1
           fi
-
+ 
       - name: Check the slug is free
         run: |
           if aws s3 ls "s3://$BUCKET/hls/$SLUG/index.m3u8" --endpoint-url "$R2_ENDPOINT" >/dev/null 2>&1; then
@@ -94,20 +94,20 @@ jobs:
               echo "::error::hls/$SLUG/ already exists. Pick a new slug, or tick 'overwrite' to replace it."; exit 1
             fi
           fi
-
+ 
       - name: Install ffmpeg
         run: |
           if ! command -v ffmpeg >/dev/null || [ ! -f /usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf ]; then
             sudo apt-get update -q && sudo apt-get install -y -q ffmpeg fonts-dejavu-core
           fi
-
+ 
       - name: Download source from R2
         run: |
           EXT="${SOURCE_KEY##*.}"; [[ "$EXT" == "$SOURCE_KEY" ]] && EXT=mp4
           aws s3 cp "s3://$BUCKET/$SOURCE_KEY" "source.$EXT" --only-show-errors --endpoint-url "$R2_ENDPOINT"
           echo "SRC=source.$EXT" >> "$GITHUB_ENV"
           ls -lh "source.$EXT"
-
+ 
       - name: Make the countdown intro
         run: |
           set -euo pipefail
@@ -143,18 +143,18 @@ jobs:
             make_intro "Feature Presentation" "hls/_intro/"
             echo "Shared countdown intro created (used by older movies)"
           fi
-
+ 
       - name: Encode and upload as it goes
         run: |
           set -uo pipefail
           DEST="s3://$BUCKET/hls/$SLUG/"
           mkdir -p out
-
+ 
           probe() { ffprobe -v error -select_streams "$1" -show_entries "stream=$2" -of csv=p=0 "$SRC" | head -1; }
           DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$SRC")
           VCODEC=$(probe v:0 codec_name); PIXFMT=$(probe v:0 pix_fmt); ACODEC=$(probe a:0 codec_name || true)
           echo "Source: video=$VCODEC ($PIXFMT) audio=${ACODEC:-none} length=${DUR}s"
-
+ 
           if [[ "$MODE" == "fast" ]]; then
             if [[ "$VCODEC" != "h264" || "$PIXFMT" == *10* ]]; then
               echo "::error::Fast mode needs 8-bit H.264 video, but this file is $VCODEC ($PIXFMT). Run again with mode = encode."; exit 1
@@ -167,7 +167,7 @@ jobs:
                    -force_key_frames "expr:gte(t,n_forced*$SEG)" -sc_threshold 0)
             AUDIO=(-c:a aac -b:a 128k -ac 2 -ar 48000)
           fi
-
+ 
           write_meta() {  # $1 = complete (true/false), $2 = duration
             python3 -c 'import json,os,sys; print(json.dumps({"version": 2, "mode": os.environ["MODE"], "targetSeconds": int(os.environ["SEG"]),
               "duration": float(sys.argv[2]), "complete": sys.argv[1] == "true", "title": os.environ.get("TITLE") or os.environ["SLUG"]}))' \
@@ -175,11 +175,11 @@ jobs:
             aws s3 cp out/meta.json "${DEST}meta.json" --content-type application/json \
               --cache-control no-cache --only-show-errors --endpoint-url "$R2_ENDPOINT"
           }
-
+ 
           # Sum of segment lengths in a playlist = how much of the movie is ready.
           ready_seconds() { awk -F'[:,]' '/^#EXTINF/ {s+=$2} END {printf "%.0f", s+0}' "$1"; }
           fmt() { printf '%d:%02d:%02d' $(($1/3600)) $(($1%3600/60)) $(($1%60)); }
-
+ 
           # Copy the playlist first, then every finished segment, then the playlist.
           # So viewers never get a playlist pointing at a segment that isn't uploaded yet.
           sync_up() {
@@ -190,14 +190,14 @@ jobs:
             aws s3 cp out/snapshot.m3u8 "${DEST}index.m3u8" --content-type application/vnd.apple.mpegurl \
               --cache-control no-cache --only-show-errors --endpoint-url "$R2_ENDPOINT" || return 1
           }
-
+ 
           ffmpeg -hide_banner -nostdin -loglevel warning -stats -stats_period 15 -y -i "$SRC" \
             -map 0:v:0 -map "0:a:0?" "${VIDEO[@]}" "${AUDIO[@]}" \
             -f hls -hls_time "$SEG" -hls_playlist_type event \
             -hls_flags independent_segments+temp_file \
             -hls_segment_filename "out/seg_%05d.ts" out/index.m3u8 &
           FF=$!
-
+ 
           START=$(date +%s); META_SENT=0; READY=0; WARNED=0
           TOTAL=${DUR%.*}
           while kill -0 "$FF" 2>/dev/null; do
@@ -205,11 +205,11 @@ jobs:
             kill -0 "$FF" 2>/dev/null || break
             sync_up || { echo "(upload will retry)"; continue; }
             [[ $META_SENT == 1 ]] || { write_meta false "$DUR" && META_SENT=1; }
-
+ 
             DONE=$(ready_seconds out/snapshot.m3u8); WALL=$(( $(date +%s) - START ))
             SPEED=$(awk -v d="$DONE" -v w="$WALL" 'BEGIN {printf "%.1f", (w>0 ? d/w : 0)}')
             echo ">> Uploaded $(fmt "$DONE") of $(fmt "$TOTAL")  (${SPEED}x real time)"
-
+ 
             if (( WALL >= 60 )) && awk -v s="$SPEED" 'BEGIN {exit !(s < 1.2)}' && (( WARNED == 0 )); then
               echo "::warning::Encoding at only ${SPEED}x real time. Viewers may catch up to it and buffer. Wait for it to finish before starting, or use fast mode."
               WARNED=1
@@ -224,10 +224,10 @@ jobs:
               fi
             fi
           done
-
+ 
           wait "$FF"; CODE=$?
           if (( CODE != 0 )); then echo "::error::ffmpeg failed (exit $CODE). See the log above."; exit "$CODE"; fi
-
+ 
           # Final upload with the finished playlist, then mark the movie complete.
           OK=0; for i in 1 2 3; do if sync_up; then OK=1; break; fi; sleep 5; done
           (( OK == 1 )) || { echo "::error::Final upload failed"; exit 1; }
@@ -243,3 +243,4 @@ jobs:
             echo "::notice::READY - finished, safe to start the showing (movie=$SLUG)"
             if [[ "$AUTOPLAY" == "true" ]]; then curl -fsS "$WORKER_URL/play?movie=$SLUG&countdown=30&key=$WORKER_ADMIN_KEY" || true; fi
           fi
+ 
