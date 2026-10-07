@@ -4,6 +4,7 @@
 #   method = file      a subtitle file you uploaded to R2 (.srt/.vtt/.ass), e.g. from a subtitle site
 #   method = embedded  subtitles already inside the movie file (usually .mkv)
 #   method = generate  made from the movie's audio with Whisper (about 30-60 min for a full movie)
+#   method = all       a .zip of subtitle files, or a .mkv/.mks with several tracks: adds every language at once
 # translate_to adds machine-translated copies (e.g. es,fr,pt).
 # Output: hls/<slug>/subs/<lang>.vtt and hls/<slug>/subs/index.json
 #
@@ -18,15 +19,15 @@ on:
         description: "The movie's slug (same as when you encoded it)"
         required: true
       method:
-        description: "file = subtitle file, embedded = inside the movie, generate = from the audio"
+        description: "file = one subtitle file, all = zip or multi-track file (every language), embedded = one track inside the movie, generate = from the audio"
         type: choice
-        options: [file, embedded, generate]
+        options: [file, all, embedded, generate]
         default: file
       source_key:
-        description: "File name in R2: the subtitle file (file) or the movie (embedded/generate)"
+        description: "File name in R2: the subtitle file (file), the .zip or .mkv/.mks (all), or the movie (embedded/generate)"
         required: true
       language:
-        description: "Language code of the subtitles, e.g. en. Use auto with generate to detect it"
+        description: "Language code of the subtitles, e.g. en. Use auto with generate. Ignored for all (read from each file)"
         default: "en"
       translate_to:
         description: "Optional: more languages to machine-translate into, e.g. es,fr,pt"
@@ -100,11 +101,13 @@ jobs:
           METHOD=file      SRC is a subtitle file (.srt, .vtt, .ass, .ssa) from a subtitle site
           METHOD=embedded  SRC is a movie (usually .mkv) with text subtitles inside; TRACK picks which
           METHOD=generate  SRC is a movie; subtitles are generated from its audio with Whisper
+          METHOD=all       SRC is a .zip of subtitle files, or a .mkv/.mks/.mp4 with several subtitle
+                           tracks; every language found is added in one run
 
           Writes OUT/<lang>.vtt for the source language and each language in TRANSLATE,
           and merges them into OUT/index.json (starting from INDEX if it exists).
           """
-          import json, os, re, subprocess, sys, textwrap, time
+          import json, os, re, subprocess, sys, textwrap, time, zipfile
 
           METHOD = os.environ["METHOD"]
           SRC = os.environ["SRC"]
@@ -121,7 +124,38 @@ jobs:
               "pt": "Português", "nl": "Nederlands", "ru": "Русский", "uk": "Українська", "pl": "Polski",
               "tr": "Türkçe", "ar": "العربية", "hi": "हिन्दी", "ja": "日本語", "ko": "한국어", "zh": "中文",
               "id": "Bahasa Indonesia", "vi": "Tiếng Việt", "th": "ไทย", "tl": "Tagalog", "sv": "Svenska",
+              "pt-br": "Português (Brasil)", "el": "Ελληνικά", "he": "עברית", "ro": "Română", "cs": "Čeština",
+              "hu": "Magyar", "da": "Dansk", "fi": "Suomi", "no": "Norsk", "ms": "Bahasa Melayu", "bg": "Български",
+              "hr": "Hrvatski", "sr": "Srpski", "fa": "فارسی", "bn": "বাংলা",
           }
+
+          # How languages show up in file names and track tags -> our code.
+          LANG_WORDS = {
+              "english": "en", "eng": "en", "en": "en",
+              "spanish": "es", "espanol": "es", "español": "es", "castellano": "es", "latino": "es", "spa": "es", "es": "es",
+              "french": "fr", "francais": "fr", "français": "fr", "fre": "fr", "fra": "fr", "fr": "fr",
+              "german": "de", "deutsch": "de", "ger": "de", "deu": "de", "de": "de",
+              "italian": "it", "italiano": "it", "ita": "it", "it": "it",
+              "portuguese": "pt", "portugues": "pt", "por": "pt", "pt": "pt",
+              "brazilian": "pt-br", "brazil": "pt-br", "pob": "pt-br", "ptbr": "pt-br", "pt-br": "pt-br", "pt_br": "pt-br",
+              "dutch": "nl", "nederlands": "nl", "dut": "nl", "nld": "nl", "nl": "nl",
+              "russian": "ru", "rus": "ru", "ru": "ru", "ukrainian": "uk", "ukr": "uk", "uk": "uk",
+              "polish": "pl", "pol": "pl", "pl": "pl", "turkish": "tr", "tur": "tr", "tr": "tr",
+              "arabic": "ar", "ara": "ar", "ar": "ar", "hindi": "hi", "hin": "hi", "hi": "hi",
+              "japanese": "ja", "jpn": "ja", "ja": "ja", "korean": "ko", "kor": "ko", "ko": "ko",
+              "chinese": "zh", "chi": "zh", "zho": "zh", "chs": "zh", "cht": "zh", "zh": "zh",
+              "indonesian": "id", "ind": "id", "id": "id", "vietnamese": "vi", "vie": "vi", "vi": "vi",
+              "thai": "th", "tha": "th", "th": "th", "tagalog": "tl", "filipino": "tl", "tgl": "tl", "fil": "tl", "tl": "tl",
+              "swedish": "sv", "swe": "sv", "sv": "sv", "greek": "el", "gre": "el", "ell": "el", "el": "el",
+              "hebrew": "he", "heb": "he", "he": "he", "romanian": "ro", "rum": "ro", "ron": "ro", "ro": "ro",
+              "czech": "cs", "cze": "cs", "ces": "cs", "cs": "cs", "hungarian": "hu", "hun": "hu", "hu": "hu",
+              "danish": "da", "dan": "da", "da": "da", "finnish": "fi", "fin": "fi", "fi": "fi",
+              "norwegian": "no", "nor": "no", "nob": "no", "no": "no", "malay": "ms", "may": "ms", "msa": "ms", "ms": "ms",
+              "bulgarian": "bg", "bul": "bg", "bg": "bg", "croatian": "hr", "hrv": "hr", "hr": "hr",
+              "serbian": "sr", "srp": "sr", "sr": "sr", "persian": "fa", "farsi": "fa", "per": "fa", "fas": "fa", "fa": "fa",
+              "bengali": "bn", "ben": "bn", "bn": "bn",
+          }
+          SUB_EXTS = (".srt", ".vtt", ".ass", ".ssa")
 
 
           def fail(msg):
@@ -194,14 +228,106 @@ jobs:
 
           # ---------- the three methods ----------
 
-          def from_file():
-              ext = os.path.splitext(SRC)[1].lower()
+          def parse_file(path):
+              """Returns cues, or None if the file can't be read."""
+              ext = os.path.splitext(path)[1].lower()
               if ext in (".srt", ".vtt", ".txt", ""):
-                  return parse_subtitles(read_text_file(SRC))
-              ok, err = ffmpeg_to_srt(["-i", SRC], "converted.srt")
-              if not ok:
-                  fail(f"Couldn't read this subtitle file ({ext}). Use .srt or .vtt if you can. {err}")
-              return parse_subtitles(read_text_file("converted.srt"))
+                  return parse_subtitles(read_text_file(path))
+              tmp = path + ".converted.srt"
+              ok, _ = ffmpeg_to_srt(["-i", path], tmp)
+              return parse_subtitles(read_text_file(tmp)) if ok else None
+
+
+          def from_file():
+              cues = parse_file(SRC)
+              if cues is None:
+                  fail(f"Couldn't read this subtitle file. Use .srt or .vtt if you can.")
+              return cues
+
+
+          def lang_from_text(text):
+              """Finds a language in a file name or track title, e.g. 'Movie.2019.Spanish.srt' -> 'es'."""
+              base = os.path.splitext(os.path.basename(text))[0].lower() if text.lower().endswith(SUB_EXTS) else text.lower()
+              if re.search(r"pt[-_ ]?br|brazil", base):
+                  return "pt-br"
+              tokens = [t for t in re.split(r"[\s._\-\[\]()/,]+", base) if t]
+              for t in reversed(tokens):   # the language is usually the last word before the extension
+                  if t in LANG_WORDS:
+                      return LANG_WORDS[t]
+              return None
+
+
+          def from_all():
+              """Every language in a .zip of subtitle files, or every text track in a container file."""
+              found, notes = [], []   # found: (code, label, cues)
+              if zipfile.is_zipfile(SRC):
+                  source = "file"
+                  os.makedirs("unzipped", exist_ok=True)
+                  with zipfile.ZipFile(SRC) as z:
+                      for i, info in enumerate(z.infolist()):
+                          name = info.filename
+                          if info.is_dir() or "__macosx" in name.lower() or not name.lower().endswith(SUB_EXTS):
+                              continue
+                          if info.file_size > 20_000_000:
+                              notes.append(f"{name}: too big, skipped"); continue
+                          path = os.path.join("unzipped", f"{i}{os.path.splitext(name)[1].lower()}")  # safe local name
+                          with open(path, "wb") as f:
+                              f.write(z.read(info))
+                          code = lang_from_text(name)
+                          cues = parse_file(path)
+                          if not code:
+                              notes.append(f"{name}: couldn't tell the language. Rename it with a code, e.g. movie.es.srt"); continue
+                          if not cues:
+                              notes.append(f"{name}: no readable lines"); continue
+                          found.append((code, name, cues))
+              else:
+                  source = "embedded"
+                  info = subprocess.run(
+                      ["ffprobe", "-v", "error", "-select_streams", "s", "-show_entries",
+                       "stream=codec_name:stream_tags=language,title", "-of", "json", SRC], capture_output=True, text=True)
+                  streams = json.loads(info.stdout or "{}").get("streams", [])
+                  if not streams:
+                      fail("This file isn't a zip and has no subtitle tracks inside. Check you picked the right file.")
+                  for i, s in enumerate(streams):
+                      tags = s.get("tags", {})
+                      tag, title = tags.get("language", ""), tags.get("title", "")
+                      label = f"track {i} ({tag or '?'} {title})".replace(" )", ")")
+                      if s.get("codec_name") in ("hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle"):
+                          notes.append(f"{label}: picture-based subtitles, can't be turned into text"); continue
+                      code = (lang_from_text(title) if re.search(r"brazil|pt[-_ ]?br", title.lower()) else None) \
+                          or LANG_WORDS.get(tag.lower()) or lang_from_text(title)
+                      if not code:
+                          notes.append(f"{label}: no language tag, skipped"); continue
+                      ok, err = ffmpeg_to_srt(["-i", SRC, "-map", f"0:s:{i}"], f"track{i}.srt")
+                      cues = parse_subtitles(read_text_file(f"track{i}.srt")) if ok else None
+                      if not cues:
+                          notes.append(f"{label}: couldn't extract"); continue
+                      found.append((code, label + (" " + title if title and title not in label else ""), cues))
+
+              # One version per language: skip "forced" ones, prefer plain over SDH, then the most lines.
+              def rank(item):
+                  sdh = bool(re.search(r"\b(sdh|cc|hearing)\b", item[1].lower().replace(".", " ").replace("_", " ")))
+                  return (not sdh, len(item[2]))
+              best = {}
+              for code, label, cues in found:
+                  if "forced" in label.lower():
+                      notes.append(f"{label}: forced subtitles (only foreign-language parts), skipped"); continue
+                  if code in best:
+                      new = (code, label, cues)
+                      keep, drop = (new, best[code]) if rank(new) > rank(best[code]) else (best[code], new)
+                      notes.append(f"{drop[1]}: kept a different {code} version ({keep[1]}), skipped")
+                      best[code] = keep
+                  else:
+                      best[code] = (code, label, cues)
+
+              log("Found:")
+              for code, label, cues in best.values():
+                  log(f"  {code:6} {len(cues):5} lines  from {label}")
+              for n in notes:
+                  log(f"  - {n}")
+              if not best:
+                  fail("No usable subtitles were found in this file.")
+              return {code: (cues, source) for code, _, cues in best.values()}
 
 
           def from_embedded():
@@ -333,21 +459,29 @@ jobs:
 
           def main():
               os.makedirs(OUT, exist_ok=True)
-              if METHOD != "generate" and LANG == "auto":
-                  fail("Set 'language' to the language of the subtitles (e.g. en). 'auto' only works with generate.")
+              if METHOD in ("file", "embedded") and LANG == "auto":
+                  fail("Set 'language' to the language of the subtitles (e.g. en). 'auto' only works with generate and all.")
 
-              cues = {"file": from_file, "embedded": from_embedded, "generate": from_audio}[METHOD]()
-              if not cues:
-                  fail("No subtitle lines were found.")
+              if METHOD == "all":
+                  made = from_all()                       # language comes from each file/track
+              else:
+                  cues = {"file": from_file, "embedded": from_embedded, "generate": from_audio}[METHOD]()
+                  if not cues:
+                      fail("No subtitle lines were found.")
+                  made = {LANG: (cues, "generated" if METHOD == "generate" else METHOD)}
+
               if OFFSET:
                   log(f"Shifting all lines by {OFFSET:+.2f}s")
-                  cues = [{**c, "start": c["start"] + OFFSET, "end": c["end"] + OFFSET} for c in cues]
-                  cues = [c for c in cues if c["end"] > 0]
-              log(f"{len(cues)} lines, from {fmt(cues[0]['start'])} to {fmt(cues[-1]['end'])}")
+              for code, (cues, source) in list(made.items()):
+                  if OFFSET:
+                      cues = [{**c, "start": c["start"] + OFFSET, "end": c["end"] + OFFSET} for c in cues]
+                      cues = [c for c in cues if c["end"] > 0]
+                  made[code] = (cues, source)
+                  log(f"{code}: {len(cues)} lines, from {fmt(cues[0]['start'])} to {fmt(cues[-1]['end'])}")
 
-              made = {LANG: (cues, "generated" if METHOD == "generate" else METHOD)}
               if TRANSLATE:
-                  for code, tcues in translate_all(cues, LANG, TRANSLATE).items():
+                  src = LANG if LANG in made else ("en" if "en" in made else next(iter(made)))
+                  for code, tcues in translate_all(made[src][0], src, [t for t in TRANSLATE if t not in made]).items():
                       made[code] = (tcues, "translated")
 
               index = {"languages": []}
