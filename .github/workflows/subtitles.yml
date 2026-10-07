@@ -126,7 +126,9 @@ jobs:
               "id": "Bahasa Indonesia", "vi": "Tiếng Việt", "th": "ไทย", "tl": "Tagalog", "sv": "Svenska",
               "pt-br": "Português (Brasil)", "el": "Ελληνικά", "he": "עברית", "ro": "Română", "cs": "Čeština",
               "hu": "Magyar", "da": "Dansk", "fi": "Suomi", "no": "Norsk", "ms": "Bahasa Melayu", "bg": "Български",
-              "hr": "Hrvatski", "sr": "Srpski", "fa": "فارسی", "bn": "বাংলা",
+              "hr": "Hrvatski", "sr": "Srpski", "fa": "فارسی", "bn": "বাংলা", "zh-tw": "中文 (繁體)",
+              "ca": "Català", "sk": "Slovenčina", "sl": "Slovenščina", "lt": "Lietuvių", "lv": "Latviešu", "et": "Eesti",
+              "ta": "தமிழ்", "te": "తెలుగు", "ur": "اردو", "ml": "മലയാളം", "is": "Íslenska", "sq": "Shqip",
           }
 
           # How languages show up in file names and track tags -> our code.
@@ -154,6 +156,14 @@ jobs:
               "bulgarian": "bg", "bul": "bg", "bg": "bg", "croatian": "hr", "hrv": "hr", "hr": "hr",
               "serbian": "sr", "srp": "sr", "sr": "sr", "persian": "fa", "farsi": "fa", "per": "fa", "fas": "fa", "fa": "fa",
               "bengali": "bn", "ben": "bn", "bn": "bn",
+              # every other code the SubDL finder can put in a file name
+              "sq": "sq", "albanian": "sq", "az": "az", "be": "be", "bs": "bs", "bosnian": "bs", "my": "my", "ca": "ca",
+              "catalan": "ca", "eo": "eo", "et": "et", "estonian": "et", "ka": "ka", "georgian": "ka", "kl": "kl",
+              "is": "is", "icelandic": "is", "ku": "ku", "kurdish": "ku", "lv": "lv", "latvian": "lv", "lt": "lt",
+              "lithuanian": "lt", "mk": "mk", "macedonian": "mk", "ml": "ml", "malayalam": "ml", "sk": "sk", "slovak": "sk",
+              "sl": "sl", "slovenian": "sl", "si": "si", "sinhala": "si", "ta": "ta", "tamil": "ta", "te": "te", "telugu": "te",
+              "ur": "ur", "urdu": "ur", "hy": "hy", "armenian": "hy", "kk": "kk", "ky": "ky", "km": "km", "kn": "kn",
+              "mn": "mn", "eu": "eu", "basque": "eu", "gl": "gl", "galician": "gl", "ga": "ga", "irish": "ga", "jv": "jv", "su": "su",
           }
           SUB_EXTS = (".srt", ".vtt", ".ass", ".ssa")
 
@@ -250,6 +260,8 @@ jobs:
               base = os.path.splitext(os.path.basename(text))[0].lower() if text.lower().endswith(SUB_EXTS) else text.lower()
               if re.search(r"pt[-_ ]?br|brazil", base):
                   return "pt-br"
+              if re.search(r"zh[-_ ]?tw|traditional", base):
+                  return "zh-tw"
               tokens = [t for t in re.split(r"[\s._\-\[\]()/,]+", base) if t]
               for t in reversed(tokens):   # the language is usually the last word before the extension
                   if t in LANG_WORDS:
