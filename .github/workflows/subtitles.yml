@@ -11,6 +11,7 @@
 # Required repo secrets: R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET
 
 name: Add subtitles
+run-name: "Subtitles for ${{ inputs.slug }} (${{ inputs.method }})"
 
 on:
   workflow_dispatch:
