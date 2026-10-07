@@ -14,6 +14,7 @@
 # Optional (for autoplay): WORKER_URL (e.g. https://movie-live.you.workers.dev), WORKER_ADMIN_KEY
 
 name: Encode movie to HLS
+run-name: "Encode ${{ inputs.slug }} (${{ inputs.mode }})"
 
 on:
   workflow_dispatch:
